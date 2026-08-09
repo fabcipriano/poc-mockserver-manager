@@ -317,14 +317,84 @@ function requestsApiUrl(basePath) {
   return path ? `${basePath}?path=${encodeURIComponent(path)}` : basePath;
 }
 
-function renderRequestRow(entry) {
-  const row = document.createElement("tr");
-  row.innerHTML = `
-    <td>${entry.timestamp}</td>
-    <td>${entry.method}</td>
-    <td><code>${entry.path}</code></td>
-    <td>${entry.statusCode}</td>
+function escapeHtml(value) {
+  if (value === undefined || value === null) {
+    return "";
+  }
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function formatBody(body) {
+  if (body === undefined || body === null || body === "") {
+    return "(empty)";
+  }
+  if (typeof body === "string") {
+    return body;
+  }
+  try {
+    return JSON.stringify(body, null, 2);
+  } catch {
+    return String(body);
+  }
+}
+
+function renderHeaderRows(pairs) {
+  if (!pairs || pairs.length === 0) {
+    return `<tr><td colspan="2" class="requests-detail-empty">(none)</td></tr>`;
+  }
+  return pairs
+    .map((pair) => `<tr><td>${escapeHtml(pair.name)}</td><td>${escapeHtml(pair.value)}</td></tr>`)
+    .join("");
+}
+
+function renderRequestDetailRow(entry) {
+  const detailRow = document.createElement("tr");
+  detailRow.className = "requests-detail-row";
+  detailRow.hidden = true;
+  detailRow.innerHTML = `
+    <td colspan="5">
+      <div class="requests-detail">
+        <div class="requests-detail-column">
+          <h3>Request</h3>
+          <h4>Headers</h4>
+          <table class="requests-detail-headers"><tbody>${renderHeaderRows(entry.requestHeaders)}</tbody></table>
+          <h4>Body</h4>
+          <pre class="requests-detail-body">${escapeHtml(formatBody(entry.requestBody))}</pre>
+        </div>
+        <div class="requests-detail-column">
+          <h3>Response</h3>
+          <h4>Headers</h4>
+          <table class="requests-detail-headers"><tbody>${renderHeaderRows(entry.responseHeaders)}</tbody></table>
+          <h4>Body</h4>
+          <pre class="requests-detail-body">${escapeHtml(formatBody(entry.responseBody))}</pre>
+        </div>
+      </div>
+    </td>
   `;
+  return detailRow;
+}
+
+function renderRequestRow(entry, detailRow) {
+  const row = document.createElement("tr");
+  row.className = "requests-row";
+  row.innerHTML = `
+    <td>${escapeHtml(entry.timestamp)}</td>
+    <td>${escapeHtml(entry.method)}</td>
+    <td><code>${escapeHtml(entry.path)}</code></td>
+    <td>${escapeHtml(entry.statusCode)}</td>
+    <td><button type="button" class="requests-expand-toggle" aria-expanded="false">Details</button></td>
+  `;
+  row.querySelector(".requests-expand-toggle").addEventListener("click", (event) => {
+    const expanded = !detailRow.hidden;
+    detailRow.hidden = expanded;
+    event.currentTarget.setAttribute("aria-expanded", String(!expanded));
+    event.currentTarget.textContent = expanded ? "Details" : "Hide";
+  });
   return row;
 }
 
@@ -332,8 +402,17 @@ function updateRequestsEmptyState() {
   requestsEmptyState.hidden = requestsBody.children.length > 0;
 }
 
+function appendRequestRow(entry) {
+  const detailRow = renderRequestDetailRow(entry);
+  requestsBody.appendChild(renderRequestRow(entry, detailRow));
+  requestsBody.appendChild(detailRow);
+}
+
 function prependRequestRow(entry) {
-  requestsBody.insertBefore(renderRequestRow(entry), requestsBody.firstChild);
+  const detailRow = renderRequestDetailRow(entry);
+  const summaryRow = renderRequestRow(entry, detailRow);
+  requestsBody.insertBefore(detailRow, requestsBody.firstChild);
+  requestsBody.insertBefore(summaryRow, detailRow);
   updateRequestsEmptyState();
 }
 
@@ -345,7 +424,7 @@ async function loadRequestHistory() {
   const entries = await response.json();
   requestsBody.innerHTML = "";
   for (const entry of entries) {
-    requestsBody.appendChild(renderRequestRow(entry));
+    appendRequestRow(entry);
   }
   updateRequestsEmptyState();
 }

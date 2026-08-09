@@ -234,6 +234,24 @@ def _path_filter_matcher(path_query):
     return ".*" + re.escape(path_query) + ".*"
 
 
+def _observed_body(body):
+    """Normalizes an observed (not matcher) request/response body into a plain value.
+
+    Unlike expectation matchers, MockServer logs actual traffic bodies in a few
+    different shapes depending on content type (raw string, `{"json": ...}`,
+    `{"string": ...}`); this collapses them all down to whatever's most useful
+    to display as-is.
+    """
+    if body is None:
+        return None
+    if isinstance(body, dict):
+        if "json" in body:
+            return body["json"]
+        if "string" in body:
+            return body["string"]
+    return body
+
+
 def _fetch_request_history(path_query=None):
     """Returns MockServer's received-request log (oldest first), optionally filtered by path."""
     body = {}
@@ -251,6 +269,10 @@ def _fetch_request_history(path_query=None):
                 "method": http_request.get("method"),
                 "path": http_request.get("path"),
                 "statusCode": http_response.get("statusCode"),
+                "requestHeaders": _multimap_to_pairs(http_request.get("headers")),
+                "requestBody": _observed_body(http_request.get("body")),
+                "responseHeaders": _multimap_to_pairs(http_response.get("headers")),
+                "responseBody": _observed_body(http_response.get("body")),
             }
         )
     return history
