@@ -34,7 +34,7 @@ const successBannerDismiss = document.getElementById("success-banner-dismiss");
 
 // --- navigation ---
 
-const VALID_PAGES = ["create", "list", "help"];
+const VALID_PAGES = ["create", "list", "requests", "help"];
 let successBannerTimeout = null;
 
 function getCurrentPageFromHash() {
@@ -70,7 +70,11 @@ function showSuccessBanner(message) {
 }
 
 successBannerDismiss.addEventListener("click", hideSuccessBanner);
-window.addEventListener("hashchange", () => showPage(getCurrentPageFromHash()));
+window.addEventListener("hashchange", () => {
+  const page = getCurrentPageFromHash();
+  showPage(page);
+  syncRequestsPageStream(page);
+});
 
 function showError(message) {
   formError.textContent = message;
@@ -281,5 +285,131 @@ cancelEditButton.addEventListener("click", () => {
 });
 refreshButton.addEventListener("click", () => loadMocks().catch((err) => showError(err.message)));
 
-showPage(getCurrentPageFromHash());
+// --- Recent Requests page: history load, live tail (SSE), path filter, pause/resume ---
+
+const requestsBody = document.getElementById("requests-body");
+const requestsEmptyState = document.getElementById("requests-empty-state");
+const requestsPathFilter = document.getElementById("requests-path-filter");
+const requestsPauseToggle = document.getElementById("requests-pause-toggle");
+const requestsError = document.getElementById("requests-error");
+
+let requestsEventSource = null;
+let requestsPaused = false;
+let requestsPendingQueue = [];
+let requestsFilterDebounce = null;
+
+function showRequestsError(message) {
+  requestsError.textContent = message;
+  requestsError.hidden = false;
+}
+
+function clearRequestsError() {
+  requestsError.hidden = true;
+  requestsError.textContent = "";
+}
+
+function currentRequestsPathFilter() {
+  return requestsPathFilter.value.trim();
+}
+
+function requestsApiUrl(basePath) {
+  const path = currentRequestsPathFilter();
+  return path ? `${basePath}?path=${encodeURIComponent(path)}` : basePath;
+}
+
+function renderRequestRow(entry) {
+  const row = document.createElement("tr");
+  row.innerHTML = `
+    <td>${entry.timestamp}</td>
+    <td>${entry.method}</td>
+    <td><code>${entry.path}</code></td>
+    <td>${entry.statusCode}</td>
+  `;
+  return row;
+}
+
+function updateRequestsEmptyState() {
+  requestsEmptyState.hidden = requestsBody.children.length > 0;
+}
+
+function prependRequestRow(entry) {
+  requestsBody.insertBefore(renderRequestRow(entry), requestsBody.firstChild);
+  updateRequestsEmptyState();
+}
+
+async function loadRequestHistory() {
+  const response = await fetch(requestsApiUrl("/mock-ui/api/requests"));
+  if (!response.ok) {
+    throw new Error(`failed to load recent requests: ${response.status}`);
+  }
+  const entries = await response.json();
+  requestsBody.innerHTML = "";
+  for (const entry of entries) {
+    requestsBody.appendChild(renderRequestRow(entry));
+  }
+  updateRequestsEmptyState();
+}
+
+function closeRequestsStream() {
+  if (requestsEventSource) {
+    requestsEventSource.close();
+    requestsEventSource = null;
+  }
+}
+
+function openRequestsStream() {
+  closeRequestsStream();
+  requestsEventSource = new EventSource(requestsApiUrl("/mock-ui/api/requests/stream"));
+  requestsEventSource.onmessage = (event) => {
+    const entry = JSON.parse(event.data);
+    if (requestsPaused) {
+      requestsPendingQueue.push(entry);
+    } else {
+      prependRequestRow(entry);
+    }
+  };
+  requestsEventSource.onerror = () => {
+    showRequestsError("Lost connection to the live request stream. Reopen the Recent Requests page to reconnect.");
+  };
+}
+
+function syncRequestsPageStream(page) {
+  if (page === "requests") {
+    if (!requestsEventSource) {
+      clearRequestsError();
+      loadRequestHistory().catch((err) => showRequestsError(err.message));
+      openRequestsStream();
+    }
+  } else {
+    closeRequestsStream();
+  }
+}
+
+requestsPauseToggle.addEventListener("click", () => {
+  requestsPaused = !requestsPaused;
+  requestsPauseToggle.textContent = requestsPaused ? "Resume" : "Pause";
+  requestsPauseToggle.classList.toggle("paused", requestsPaused);
+  if (!requestsPaused) {
+    for (const entry of requestsPendingQueue) {
+      prependRequestRow(entry);
+    }
+    requestsPendingQueue = [];
+  }
+});
+
+requestsPathFilter.addEventListener("input", () => {
+  if (requestsFilterDebounce) {
+    clearTimeout(requestsFilterDebounce);
+  }
+  requestsFilterDebounce = setTimeout(() => {
+    clearRequestsError();
+    requestsPendingQueue = [];
+    loadRequestHistory().catch((err) => showRequestsError(err.message));
+    openRequestsStream();
+  }, 300);
+});
+
+const initialPage = getCurrentPageFromHash();
+showPage(initialPage);
+syncRequestsPageStream(initialPage);
 loadMocks().catch((err) => showError(err.message));

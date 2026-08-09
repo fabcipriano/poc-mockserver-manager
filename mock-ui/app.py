@@ -1,9 +1,11 @@
 import json
 import os
+import re
+import time
 import urllib.error
 import urllib.request
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 MOCKSERVER_URL = os.environ.get("MOCKSERVER_URL", "http://mockserver")
 
@@ -213,6 +215,78 @@ def update_mock(mock_id):
 def delete_mock(mock_id):
     _mockserver_put("/mockserver/clear", {"id": mock_id})
     return "", 204
+
+
+REQUEST_HISTORY_LIMIT = 100
+REQUEST_STREAM_POLL_SECONDS = 1
+
+
+def _path_filter_matcher(path_query):
+    """Turns a plain-text path filter into MockServer's path matcher.
+
+    MockServer's retrieve `path` matcher is a full-match regex, not a substring
+    search (confirmed live: a plain `/booking` only matches the literal path
+    `/booking`, not `/booking/1`) - so a developer's plain text needs wrapping
+    in `.*...*` to behave like the "contains" search they expect.
+    """
+    if not path_query:
+        return None
+    return ".*" + re.escape(path_query) + ".*"
+
+
+def _fetch_request_history(path_query=None):
+    """Returns MockServer's received-request log (oldest first), optionally filtered by path."""
+    body = {}
+    matcher = _path_filter_matcher(path_query)
+    if matcher:
+        body["path"] = matcher
+    entries = _mockserver_put("/mockserver/retrieve?type=REQUEST_RESPONSES", body) or []
+    history = []
+    for entry in entries:
+        http_request = entry.get("httpRequest") or {}
+        http_response = entry.get("httpResponse") or {}
+        history.append(
+            {
+                "timestamp": entry.get("timestamp"),
+                "method": http_request.get("method"),
+                "path": http_request.get("path"),
+                "statusCode": http_response.get("statusCode"),
+            }
+        )
+    return history
+
+
+@app.get("/mock-ui/api/requests")
+def list_requests():
+    history = _fetch_request_history(request.args.get("path"))
+    newest_first = list(reversed(history))
+    return jsonify(newest_first[:REQUEST_HISTORY_LIMIT])
+
+
+@app.get("/mock-ui/api/requests/stream")
+def stream_requests():
+    path_query = request.args.get("path")
+
+    def event_stream():
+        # Start tailing from "now" - the page loads existing history separately
+        # via /mock-ui/api/requests, so the stream should only push genuinely
+        # new arrivals, not replay what was already fetched.
+        history = _fetch_request_history(path_query)
+        last_timestamp = history[-1]["timestamp"] if history else ""
+        while True:
+            time.sleep(REQUEST_STREAM_POLL_SECONDS)
+            history = _fetch_request_history(path_query)
+            new_entries = [entry for entry in history if entry["timestamp"] > last_timestamp]
+            for entry in new_entries:
+                yield f"data: {json.dumps(entry)}\n\n"
+            if new_entries:
+                last_timestamp = new_entries[-1]["timestamp"]
+
+    return Response(
+        event_stream(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/mock-ui/")

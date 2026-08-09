@@ -345,6 +345,49 @@ tbody tr:last-child td {
   color: var(--color-accent);
 }
 
+/* --- recent requests page --- */
+
+.requests-toolbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.requests-filter-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-weight: 600;
+  font-size: 0.9rem;
+  flex: 0 0 18rem;
+}
+
+#requests-pause-toggle {
+  background: var(--color-surface-alt);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+}
+
+#requests-pause-toggle:hover {
+  background: var(--color-surface);
+}
+
+#requests-pause-toggle.paused {
+  background: var(--color-danger);
+  color: var(--color-surface-alt);
+  border-color: var(--color-danger);
+}
+
+#requests-pause-toggle.paused:hover {
+  background: #8a2536;
+}
+
+#requests-empty-state {
+  color: var(--color-text-muted);
+  margin-top: 1rem;
+}
+
 /* --- help page --- */
 
 .help-article {
