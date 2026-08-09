@@ -137,6 +137,14 @@
             Filter by path
             <input type="text" id="requests-path-filter" placeholder="e.g. booking" />
           </label>
+          <label class="requests-filter-label requests-status-filter-label">
+            Mocked or forwarded
+            <select id="requests-status-filter">
+              <option value="">All requests</option>
+              <option value="true">Mocked only</option>
+              <option value="false">Forwarded only</option>
+            </select>
+          </label>
           <button type="button" id="requests-pause-toggle">Pause</button>
         </div>
         <p id="requests-error" class="error" hidden></p>
@@ -149,6 +157,7 @@
                 <th>Method</th>
                 <th>Path</th>
                 <th>Status</th>
+                <th>Source</th>
                 <th></th>
               </tr>
             </thead>

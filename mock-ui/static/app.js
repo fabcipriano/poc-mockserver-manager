@@ -290,6 +290,7 @@ refreshButton.addEventListener("click", () => loadMocks().catch((err) => showErr
 const requestsBody = document.getElementById("requests-body");
 const requestsEmptyState = document.getElementById("requests-empty-state");
 const requestsPathFilter = document.getElementById("requests-path-filter");
+const requestsStatusFilter = document.getElementById("requests-status-filter");
 const requestsPauseToggle = document.getElementById("requests-pause-toggle");
 const requestsError = document.getElementById("requests-error");
 
@@ -313,8 +314,16 @@ function currentRequestsPathFilter() {
 }
 
 function requestsApiUrl(basePath) {
+  const params = new URLSearchParams();
   const path = currentRequestsPathFilter();
-  return path ? `${basePath}?path=${encodeURIComponent(path)}` : basePath;
+  if (path) {
+    params.set("path", path);
+  }
+  if (requestsStatusFilter.value) {
+    params.set("mocked", requestsStatusFilter.value);
+  }
+  const query = params.toString();
+  return query ? `${basePath}?${query}` : basePath;
 }
 
 function escapeHtml(value) {
@@ -357,7 +366,7 @@ function renderRequestDetailRow(entry) {
   detailRow.className = "requests-detail-row";
   detailRow.hidden = true;
   detailRow.innerHTML = `
-    <td colspan="5">
+    <td colspan="6">
       <div class="requests-detail">
         <div class="requests-detail-column">
           <h3>Request</h3>
@@ -382,11 +391,14 @@ function renderRequestDetailRow(entry) {
 function renderRequestRow(entry, detailRow) {
   const row = document.createElement("tr");
   row.className = "requests-row";
+  const sourceLabel = entry.mocked ? "Mocked" : "Forwarded";
+  const sourceClass = entry.mocked ? "requests-source-mocked" : "requests-source-forwarded";
   row.innerHTML = `
     <td>${escapeHtml(entry.timestamp)}</td>
     <td>${escapeHtml(entry.method)}</td>
     <td><code>${escapeHtml(entry.path)}</code></td>
     <td>${escapeHtml(entry.statusCode)}</td>
+    <td><span class="badge ${sourceClass}">${sourceLabel}</span></td>
     <td><button type="button" class="requests-expand-toggle" aria-expanded="false">Details</button></td>
   `;
   row.querySelector(".requests-expand-toggle").addEventListener("click", (event) => {
@@ -476,17 +488,21 @@ requestsPauseToggle.addEventListener("click", () => {
   }
 });
 
+function reloadRequestsForFilterChange() {
+  clearRequestsError();
+  requestsPendingQueue = [];
+  loadRequestHistory().catch((err) => showRequestsError(err.message));
+  openRequestsStream();
+}
+
 requestsPathFilter.addEventListener("input", () => {
   if (requestsFilterDebounce) {
     clearTimeout(requestsFilterDebounce);
   }
-  requestsFilterDebounce = setTimeout(() => {
-    clearRequestsError();
-    requestsPendingQueue = [];
-    loadRequestHistory().catch((err) => showRequestsError(err.message));
-    openRequestsStream();
-  }, 300);
+  requestsFilterDebounce = setTimeout(reloadRequestsForFilterChange, 300);
 });
+
+requestsStatusFilter.addEventListener("change", reloadRequestsForFilterChange);
 
 const initialPage = getCurrentPageFromHash();
 showPage(initialPage);

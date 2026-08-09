@@ -252,8 +252,31 @@ def _observed_body(body):
     return body
 
 
-def _fetch_request_history(path_query=None):
-    """Returns MockServer's received-request log (oldest first), optionally filtered by path."""
+def _is_forwarded_response(http_response):
+    """True if an observed response was proxied to a real backend rather than answered by a canned mock.
+
+    MockServer can only report a real HTTP reason phrase or round-trip timing when it actually made an
+    outbound call (an `httpForward` expectation); a canned `httpResponse` expectation is synthesized
+    locally and this tool's own `to_expectation` never sets either field, so their presence reliably
+    marks a response as forwarded rather than mocked. See design.md in the
+    add-recent-requests-mocked-filter change for the empirical basis and known limits of this heuristic.
+    """
+    if http_response.get("reasonPhrase"):
+        return True
+    headers = http_response.get("headers") or {}
+    return any(name.lower() == "x-mockserver-response-time-ms" for name in headers)
+
+
+def _parse_mocked_filter(mocked_query):
+    """Turns the `mocked` query param ("true"/"false"/absent) into True/False/None (no filter)."""
+    if mocked_query is None:
+        return None
+    return mocked_query.lower() == "true"
+
+
+def _fetch_request_history(path_query=None, mocked_filter=None):
+    """Returns MockServer's received-request log (oldest first), optionally filtered by path and/or
+    by whether the request was mocked (True) or forwarded (False)."""
     body = {}
     matcher = _path_filter_matcher(path_query)
     if matcher:
@@ -263,12 +286,16 @@ def _fetch_request_history(path_query=None):
     for entry in entries:
         http_request = entry.get("httpRequest") or {}
         http_response = entry.get("httpResponse") or {}
+        mocked = not _is_forwarded_response(http_response)
+        if mocked_filter is not None and mocked != mocked_filter:
+            continue
         history.append(
             {
                 "timestamp": entry.get("timestamp"),
                 "method": http_request.get("method"),
                 "path": http_request.get("path"),
                 "statusCode": http_response.get("statusCode"),
+                "mocked": mocked,
                 "requestHeaders": _multimap_to_pairs(http_request.get("headers")),
                 "requestBody": _observed_body(http_request.get("body")),
                 "responseHeaders": _multimap_to_pairs(http_response.get("headers")),
@@ -280,7 +307,8 @@ def _fetch_request_history(path_query=None):
 
 @app.get("/mock-ui/api/requests")
 def list_requests():
-    history = _fetch_request_history(request.args.get("path"))
+    mocked_filter = _parse_mocked_filter(request.args.get("mocked"))
+    history = _fetch_request_history(request.args.get("path"), mocked_filter)
     newest_first = list(reversed(history))
     return jsonify(newest_first[:REQUEST_HISTORY_LIMIT])
 
@@ -288,16 +316,17 @@ def list_requests():
 @app.get("/mock-ui/api/requests/stream")
 def stream_requests():
     path_query = request.args.get("path")
+    mocked_filter = _parse_mocked_filter(request.args.get("mocked"))
 
     def event_stream():
         # Start tailing from "now" - the page loads existing history separately
         # via /mock-ui/api/requests, so the stream should only push genuinely
         # new arrivals, not replay what was already fetched.
-        history = _fetch_request_history(path_query)
+        history = _fetch_request_history(path_query, mocked_filter)
         last_timestamp = history[-1]["timestamp"] if history else ""
         while True:
             time.sleep(REQUEST_STREAM_POLL_SECONDS)
-            history = _fetch_request_history(path_query)
+            history = _fetch_request_history(path_query, mocked_filter)
             new_entries = [entry for entry in history if entry["timestamp"] > last_timestamp]
             for entry in new_entries:
                 yield f"data: {json.dumps(entry)}\n\n"

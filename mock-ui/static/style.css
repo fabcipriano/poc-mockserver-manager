@@ -363,6 +363,16 @@ tbody tr:last-child td {
   flex: 0 0 18rem;
 }
 
+.requests-status-filter-label {
+  flex-basis: 12rem;
+}
+
+.requests-source-forwarded {
+  background: transparent;
+  color: var(--color-text-muted);
+  border: 1px solid var(--color-border);
+}
+
 #requests-pause-toggle {
   background: var(--color-surface-alt);
   color: var(--color-text);
