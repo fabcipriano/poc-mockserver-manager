@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-ui
+  labels:
+    app: mock-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-ui
+  template:
+    metadata:
+      labels:
+        app: mock-ui
+    spec:
+      containers:
+        - name: mock-ui
+          image: mockserver-poc/mock-ui:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MOCKSERVER_URL
+              value: "http://mockserver"
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /mock-ui/healthz
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 5

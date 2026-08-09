@@ -1,0 +1,14 @@
+{
+  "bookingid": 999,
+  "booking": {
+    "firstname": "Ada",
+    "lastname": "Lovelace",
+    "totalprice": 250,
+    "depositpaid": true,
+    "bookingdates": {
+      "checkin": "2026-09-01",
+      "checkout": "2026-09-05"
+    },
+    "additionalneeds": "mocked-response, not the real backend"
+  }
+}

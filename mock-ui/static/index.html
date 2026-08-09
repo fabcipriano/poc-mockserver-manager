@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Mock Manager</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/mock-ui/style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <nav class="sidebar" aria-label="Primary">
+      <div class="sidebar-brand">Mock Manager</div>
+      <ul class="nav-list">
+        <li><a href="#create" class="nav-link" data-page="create">Create Mock</a></li>
+        <li><a href="#list" class="nav-link" data-page="list">List Mocks</a></li>
+        <li><a href="#help" class="nav-link" data-page="help">Help</a></li>
+      </ul>
+    </nav>
+
+    <main class="content">
+      <div id="success-banner" class="banner" hidden>
+        <span id="success-banner-text"></span>
+        <button type="button" id="success-banner-dismiss" aria-label="Dismiss">&times;</button>
+      </div>
+
+      <section id="page-create" class="page">
+        <h1 id="form-title">Create a mock</h1>
+        <p class="page-intro">Create, edit, and delete MockServer expectations in real time. Every action here acts directly on MockServer - nothing is cached.</p>
+
+        <form id="mock-form">
+          <input type="hidden" id="mock-id" value="" />
+          <label>
+            Method
+            <select id="mock-method" required>
+              <option>GET</option>
+              <option>POST</option>
+              <option>PUT</option>
+              <option>PATCH</option>
+              <option>DELETE</option>
+            </select>
+          </label>
+          <label>
+            Path
+            <input type="text" id="mock-path" placeholder="/booking/1" required />
+          </label>
+          <label>
+            Status code
+            <input type="number" id="mock-status" value="200" min="100" max="599" required />
+          </label>
+          <label>
+            Response body (JSON)
+            <textarea id="mock-response-body" rows="6" placeholder='{"message": "mocked"}'></textarea>
+          </label>
+
+          <details id="matchers-section">
+            <summary>Request matchers (optional)</summary>
+            <p class="hint">Narrow which requests this mock applies to. Leave any of these empty to match on method and path alone. See the <a href="#help">Help</a> page for details on each matcher.</p>
+
+            <fieldset>
+              <legend>Path parameters</legend>
+              <p class="hint">Use <code>{name}</code> in the path above (e.g. <code>/booking/{id}</code>) to define one.</p>
+              <div id="path-parameters-rows" class="kv-rows"></div>
+              <button type="button" class="add-row" data-target="path-parameters-rows">+ Add path parameter</button>
+            </fieldset>
+
+            <fieldset>
+              <legend>Query string parameters</legend>
+              <div id="query-parameters-rows" class="kv-rows"></div>
+              <button type="button" class="add-row" data-target="query-parameters-rows">+ Add query parameter</button>
+            </fieldset>
+
+            <fieldset>
+              <legend>Headers</legend>
+              <div id="header-rows" class="kv-rows"></div>
+              <button type="button" class="add-row" data-target="header-rows">+ Add header</button>
+            </fieldset>
+
+            <fieldset>
+              <legend>Cookies</legend>
+              <div id="cookie-rows" class="kv-rows"></div>
+              <button type="button" class="add-row" data-target="cookie-rows">+ Add cookie</button>
+            </fieldset>
+
+            <fieldset>
+              <legend>Request body (JSON)</legend>
+              <label>
+                Match type
+                <select id="mock-request-body-match-type">
+                  <option value="ONLY_MATCHING_FIELDS" selected>Contains at least these fields</option>
+                  <option value="STRICT">Exact match</option>
+                </select>
+              </label>
+              <textarea id="mock-request-body" rows="4" placeholder='{"firstname": "Ada"}'></textarea>
+            </fieldset>
+          </details>
+
+          <div class="form-actions">
+            <button type="submit" id="submit-button">Create mock</button>
+            <button type="button" id="cancel-edit" hidden>Cancel</button>
+          </div>
+          <p id="form-error" class="error" hidden></p>
+        </form>
+      </section>
+
+      <section id="page-list" class="page">
+        <h1>Active mocks</h1>
+        <p class="page-intro">Every mock listed here is live in MockServer right now. The seeded catch-all forwarding rule is never shown or editable here.</p>
+        <button type="button" id="refresh-button">Refresh</button>
+        <div class="table-card">
+          <table id="mocks-table">
+            <thead>
+              <tr>
+                <th>Method</th>
+                <th>Path</th>
+                <th>Status</th>
+                <th>Body</th>
+                <th>Matchers</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="mocks-body">
+            </tbody>
+          </table>
+        </div>
+        <p id="empty-state" hidden>No active mocks. Head to <a href="#create">Create Mock</a> to add one.</p>
+      </section>
+
+      <section id="page-help" class="page">
+        <h1>Help</h1>
+        <p class="page-intro">What each request matcher does, and how mocking works in this tool.</p>
+
+        <article class="help-article">
+          <h2>The catch-all rule</h2>
+          <p>This environment seeds one forwarding rule that sends every unmocked request through to the real backend. It is never shown in the mocks list, and cannot be edited or deleted through this web interface - it's what makes pass-through work for anything you haven't mocked.</p>
+        </article>
+
+        <article class="help-article">
+          <h2>Method and path</h2>
+          <p>Every mock matches on HTTP method and path at minimum - these are the only two fields required to create a mock. Everything below is optional and narrows matching further.</p>
+        </article>
+
+        <article class="help-article">
+          <h2>Path parameters</h2>
+          <p>Write a named segment directly in the path using curly braces, e.g. <code>/booking/{id}</code>, then constrain what values that segment may take. A mock on <code>/booking/{id}</code> with <code>id=123</code> matches requests to <code>/booking/123</code> but not <code>/booking/456</code>.</p>
+        </article>
+
+        <article class="help-article">
+          <h2>Query string parameters</h2>
+          <p>Constrain the mock to requests that include a specific <code>?name=value</code> pair. A request missing that parameter, or with a different value, will not match and falls through to the real backend (or another mock).</p>
+        </article>
+
+        <article class="help-article">
+          <h2>Headers</h2>
+          <p>Constrain the mock to requests that include a specific header value, e.g. <code>X-Test: yes</code>. Useful for mocking only requests from a particular client or test run.</p>
+        </article>
+
+        <article class="help-article">
+          <h2>Cookies</h2>
+          <p>Constrain the mock to requests that include a specific cookie value, e.g. <code>session=abc</code>. Handy for mocking behavior tied to a particular session.</p>
+        </article>
+
+        <article class="help-article">
+          <h2>Request body (JSON)</h2>
+          <p>Constrain the mock to requests whose JSON body matches what you specify. Choose <strong>"Contains at least these fields"</strong> to match any request body that includes the fields you listed (extra fields are ignored), or <strong>"Exact match"</strong> to require the request body to be exactly what you specified, with nothing extra.</p>
+        </article>
+      </section>
+    </main>
+  </div>
+
+  <template id="kv-row-template">
+    <div class="kv-row">
+      <input type="text" class="kv-name" placeholder="name" />
+      <input type="text" class="kv-value" placeholder="value" />
+      <button type="button" class="remove-row" aria-label="Remove">&times;</button>
+    </div>
+  </template>
+
+  <script src="/mock-ui/app.js"></script>
+</body>
+</html>

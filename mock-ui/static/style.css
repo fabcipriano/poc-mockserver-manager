@@ -1,0 +1,370 @@
+:root {
+  color-scheme: light;
+
+  /* Palette in the family of zup.com.br's warm terracotta/wine look - see
+     openspec/changes/redesign-mock-ui-navigation/design.md Decision 1 for the
+     research this is based on and why these are distinct, not identical, values. */
+  --color-ink: #2b0f16;
+  --color-accent: #c96a4a;
+  --color-accent-dark: #8a3a22;
+  --color-surface: #faf7f6;
+  --color-surface-alt: #ffffff;
+  --color-border: #e2d6d3;
+  --color-danger: #a12f43;
+  --color-text: #2b0f16;
+  --color-text-muted: #7a6a66;
+
+  /* Asymmetric corner radius - one larger corner instead of a uniform radius. */
+  --radius: 4px 4px 4px 16px;
+  --radius-sm: 3px 3px 3px 10px;
+  --radius-pill: 4px 4px 4px 999px;
+
+  font-family: "Inter", system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+.app-shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+/* --- sidebar --- */
+
+.sidebar {
+  flex: 0 0 15rem;
+  background: var(--color-ink);
+  color: var(--color-surface-alt);
+  padding: 1.5rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.sidebar-brand {
+  font-weight: 700;
+  font-size: 1.1rem;
+  letter-spacing: 0.02em;
+}
+
+.nav-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.nav-link {
+  display: block;
+  padding: 0.6rem 0.9rem;
+  border-radius: var(--radius-sm);
+  color: rgba(255, 255, 255, 0.75);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.nav-link:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--color-surface-alt);
+}
+
+.nav-link.active {
+  background: var(--color-accent);
+  color: var(--color-surface-alt);
+  font-weight: 600;
+}
+
+/* --- content --- */
+
+.content {
+  flex: 1;
+  padding: 2rem 2.5rem;
+  max-width: 52rem;
+}
+
+.page[hidden] {
+  display: none;
+}
+
+h1 {
+  font-weight: 700;
+  font-size: 1.6rem;
+  margin: 0 0 0.4rem;
+}
+
+h2 {
+  font-weight: 600;
+  font-size: 1.1rem;
+}
+
+.page-intro {
+  color: var(--color-text-muted);
+  margin: 0 0 1.5rem;
+}
+
+/* --- banner --- */
+
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  background: var(--color-accent);
+  color: var(--color-surface-alt);
+  padding: 0.6rem 1rem;
+  border-radius: var(--radius-sm);
+  margin-bottom: 1.5rem;
+  font-weight: 500;
+}
+
+.banner button {
+  background: transparent;
+  border: none;
+  color: inherit;
+  font-size: 1.1rem;
+  cursor: pointer;
+  padding: 0 0.25rem;
+}
+
+/* --- form --- */
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  max-width: 32rem;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+input,
+select,
+textarea {
+  font: inherit;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-alt);
+  color: var(--color-text);
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+textarea {
+  font-family: ui-monospace, monospace;
+  resize: vertical;
+}
+
+.form-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+button {
+  font: inherit;
+  font-weight: 600;
+  padding: 0.5rem 1.1rem;
+  cursor: pointer;
+  border: none;
+  border-radius: var(--radius);
+  background: var(--color-accent);
+  color: var(--color-surface-alt);
+}
+
+button:hover {
+  background: var(--color-accent-dark);
+}
+
+button[type="button"]:not(.add-row):not(.remove-row):not(#success-banner-dismiss) {
+  background: var(--color-surface-alt);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+}
+
+button[type="button"]:not(.add-row):not(.remove-row):not(#success-banner-dismiss):hover {
+  background: var(--color-surface);
+}
+
+.error {
+  color: var(--color-danger);
+  font-weight: 500;
+}
+
+.hint {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: normal;
+  color: var(--color-text-muted);
+}
+
+.hint a {
+  color: var(--color-accent);
+}
+
+/* --- request matchers section --- */
+
+#matchers-section {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 0.9rem 1rem;
+  background: var(--color-surface-alt);
+}
+
+#matchers-section summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+#matchers-section fieldset {
+  border: none;
+  border-top: 1px solid var(--color-border);
+  margin: 0.9rem 0 0;
+  padding: 0.9rem 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+#matchers-section legend {
+  font-weight: 600;
+  padding: 0;
+}
+
+.kv-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.kv-row {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.kv-row input {
+  flex: 1;
+}
+
+.add-row {
+  align-self: flex-start;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.7rem;
+}
+
+.remove-row {
+  padding: 0.2rem 0.5rem;
+  line-height: 1;
+  background: transparent;
+  color: var(--color-danger);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.remove-row:hover {
+  background: var(--color-surface);
+}
+
+/* --- mocks list --- */
+
+.table-card {
+  background: var(--color-surface-alt);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-top: 1rem;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.7rem 0.9rem;
+  border-bottom: 1px solid var(--color-border);
+  vertical-align: top;
+}
+
+th {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--color-text-muted);
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.body-preview {
+  display: inline-block;
+  max-width: 20rem;
+  overflow-wrap: anywhere;
+}
+
+.badge {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.15rem 0.6rem;
+  border-radius: var(--radius-pill);
+  background: rgba(201, 106, 74, 0.15);
+  color: var(--color-accent-dark);
+  white-space: nowrap;
+}
+
+#empty-state {
+  color: var(--color-text-muted);
+  margin-top: 1rem;
+}
+
+#empty-state a {
+  color: var(--color-accent);
+}
+
+/* --- help page --- */
+
+.help-article {
+  margin-bottom: 1.5rem;
+}
+
+.help-article h2 {
+  margin-bottom: 0.3rem;
+}
+
+.help-article p {
+  margin: 0;
+  color: var(--color-text);
+  max-width: 42rem;
+}
+
+.help-article code {
+  background: var(--color-border);
+  padding: 0.05rem 0.35rem;
+  border-radius: 3px;
+  font-family: ui-monospace, monospace;
+  font-size: 0.9em;
+}

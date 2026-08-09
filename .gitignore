@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Java / Maven
+target/
+
+# OS
+.DS_Store
+
+# Personal/local overrides
+.claude/settings.local.json

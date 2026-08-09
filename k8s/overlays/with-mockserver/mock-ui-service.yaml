@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-ui
+  labels:
+    app: mock-ui
+spec:
+  selector:
+    app: mock-ui
+  ports:
+    - port: 80
+      targetPort: 8000
