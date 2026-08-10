@@ -291,13 +291,20 @@ const requestsBody = document.getElementById("requests-body");
 const requestsEmptyState = document.getElementById("requests-empty-state");
 const requestsPathFilter = document.getElementById("requests-path-filter");
 const requestsStatusFilter = document.getElementById("requests-status-filter");
+const requestsFromFilter = document.getElementById("requests-from-filter");
+const requestsToFilter = document.getElementById("requests-to-filter");
 const requestsPauseToggle = document.getElementById("requests-pause-toggle");
 const requestsError = document.getElementById("requests-error");
+const requestsRangeTruncated = document.getElementById("requests-range-truncated");
+const requestsLoadMoreButton = document.getElementById("requests-load-more");
+const requestsNoMoreMessage = document.getElementById("requests-no-more");
 
 let requestsEventSource = null;
 let requestsPaused = false;
 let requestsPendingQueue = [];
 let requestsFilterDebounce = null;
+let requestsOldestLoadedTimestamp = null;
+let requestsHasMore = false;
 
 function showRequestsError(message) {
   requestsError.textContent = message;
@@ -313,7 +320,7 @@ function currentRequestsPathFilter() {
   return requestsPathFilter.value.trim();
 }
 
-function requestsApiUrl(basePath) {
+function requestsApiUrl(basePath, { before, includeTimeRange = true } = {}) {
   const params = new URLSearchParams();
   const path = currentRequestsPathFilter();
   if (path) {
@@ -321,6 +328,19 @@ function requestsApiUrl(basePath) {
   }
   if (requestsStatusFilter.value) {
     params.set("mocked", requestsStatusFilter.value);
+  }
+  // The live tail (includeTimeRange: false) deliberately ignores from/to - a newly arriving
+  // request is always "now," so a historical time range doesn't scope it. See design.md.
+  if (includeTimeRange) {
+    if (requestsFromFilter.value) {
+      params.set("from", requestsFromFilter.value);
+    }
+    if (requestsToFilter.value) {
+      params.set("to", requestsToFilter.value);
+    }
+  }
+  if (before) {
+    params.set("before", before);
   }
   const query = params.toString();
   return query ? `${basePath}?${query}` : basePath;
@@ -414,6 +434,22 @@ function updateRequestsEmptyState() {
   requestsEmptyState.hidden = requestsBody.children.length > 0;
 }
 
+function updateRequestsPaginationUI() {
+  const hasRows = requestsBody.children.length > 0;
+  requestsLoadMoreButton.hidden = !requestsHasMore;
+  requestsNoMoreMessage.hidden = requestsHasMore || !hasRows;
+}
+
+function updateRequestsRangeTruncatedNotice(rangeTruncated, oldestAvailableTimestamp) {
+  if (rangeTruncated && oldestAvailableTimestamp) {
+    requestsRangeTruncated.textContent = `Showing requests back to ${oldestAvailableTimestamp} - earlier requests are no longer retained by MockServer.`;
+    requestsRangeTruncated.hidden = false;
+  } else {
+    requestsRangeTruncated.hidden = true;
+    requestsRangeTruncated.textContent = "";
+  }
+}
+
 function appendRequestRow(entry) {
   const detailRow = renderRequestDetailRow(entry);
   requestsBody.appendChild(renderRequestRow(entry, detailRow));
@@ -433,12 +469,35 @@ async function loadRequestHistory() {
   if (!response.ok) {
     throw new Error(`failed to load recent requests: ${response.status}`);
   }
-  const entries = await response.json();
+  const data = await response.json();
   requestsBody.innerHTML = "";
-  for (const entry of entries) {
+  for (const entry of data.entries) {
     appendRequestRow(entry);
   }
+  requestsOldestLoadedTimestamp = data.entries.length > 0 ? data.entries[data.entries.length - 1].timestamp : null;
+  requestsHasMore = data.hasMore;
   updateRequestsEmptyState();
+  updateRequestsPaginationUI();
+  updateRequestsRangeTruncatedNotice(data.rangeTruncated, data.oldestAvailableTimestamp);
+}
+
+async function loadMoreRequests() {
+  if (!requestsOldestLoadedTimestamp) {
+    return;
+  }
+  const response = await fetch(requestsApiUrl("/mock-ui/api/requests", { before: requestsOldestLoadedTimestamp }));
+  if (!response.ok) {
+    throw new Error(`failed to load older requests: ${response.status}`);
+  }
+  const data = await response.json();
+  for (const entry of data.entries) {
+    appendRequestRow(entry);
+  }
+  if (data.entries.length > 0) {
+    requestsOldestLoadedTimestamp = data.entries[data.entries.length - 1].timestamp;
+  }
+  requestsHasMore = data.hasMore;
+  updateRequestsPaginationUI();
 }
 
 function closeRequestsStream() {
@@ -450,7 +509,7 @@ function closeRequestsStream() {
 
 function openRequestsStream() {
   closeRequestsStream();
-  requestsEventSource = new EventSource(requestsApiUrl("/mock-ui/api/requests/stream"));
+  requestsEventSource = new EventSource(requestsApiUrl("/mock-ui/api/requests/stream", { includeTimeRange: false }));
   requestsEventSource.onmessage = (event) => {
     const entry = JSON.parse(event.data);
     if (requestsPaused) {
@@ -503,6 +562,12 @@ requestsPathFilter.addEventListener("input", () => {
 });
 
 requestsStatusFilter.addEventListener("change", reloadRequestsForFilterChange);
+requestsFromFilter.addEventListener("change", reloadRequestsForFilterChange);
+requestsToFilter.addEventListener("change", reloadRequestsForFilterChange);
+
+requestsLoadMoreButton.addEventListener("click", () => {
+  loadMoreRequests().catch((err) => showRequestsError(err.message));
+});
 
 const initialPage = getCurrentPageFromHash();
 showPage(initialPage);

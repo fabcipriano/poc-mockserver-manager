@@ -145,9 +145,18 @@
               <option value="false">Forwarded only</option>
             </select>
           </label>
+          <label class="requests-filter-label requests-time-filter-label">
+            From
+            <input type="datetime-local" id="requests-from-filter" step="1" />
+          </label>
+          <label class="requests-filter-label requests-time-filter-label">
+            To
+            <input type="datetime-local" id="requests-to-filter" step="1" />
+          </label>
           <button type="button" id="requests-pause-toggle">Pause</button>
         </div>
         <p id="requests-error" class="error" hidden></p>
+        <p id="requests-range-truncated" class="requests-empty-note" hidden></p>
 
         <div class="table-card">
           <table id="requests-table">
@@ -166,6 +175,10 @@
           </table>
         </div>
         <p id="requests-empty-state" hidden>No requests yet for this filter.</p>
+        <div class="requests-pagination">
+          <button type="button" id="requests-load-more" hidden>Load more</button>
+          <p id="requests-no-more" class="requests-empty-note" hidden>No older requests available.</p>
+        </div>
       </section>
 
       <section id="page-help" class="page">

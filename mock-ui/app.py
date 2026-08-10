@@ -1,9 +1,10 @@
 import json
 import os
-import re
+import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 
@@ -221,19 +222,6 @@ REQUEST_HISTORY_LIMIT = 100
 REQUEST_STREAM_POLL_SECONDS = 1
 
 
-def _path_filter_matcher(path_query):
-    """Turns a plain-text path filter into MockServer's path matcher.
-
-    MockServer's retrieve `path` matcher is a full-match regex, not a substring
-    search (confirmed live: a plain `/booking` only matches the literal path
-    `/booking`, not `/booking/1`) - so a developer's plain text needs wrapping
-    in `.*...*` to behave like the "contains" search they expect.
-    """
-    if not path_query:
-        return None
-    return ".*" + re.escape(path_query) + ".*"
-
-
 def _observed_body(body):
     """Normalizes an observed (not matcher) request/response body into a plain value.
 
@@ -274,60 +262,168 @@ def _parse_mocked_filter(mocked_query):
     return mocked_query.lower() == "true"
 
 
-def _fetch_request_history(path_query=None, mocked_filter=None):
-    """Returns MockServer's received-request log (oldest first), optionally filtered by path and/or
-    by whether the request was mocked (True) or forwarded (False)."""
-    body = {}
-    matcher = _path_filter_matcher(path_query)
-    if matcher:
-        body["path"] = matcher
-    entries = _mockserver_put("/mockserver/retrieve?type=REQUEST_RESPONSES", body) or []
-    history = []
-    for entry in entries:
-        http_request = entry.get("httpRequest") or {}
-        http_response = entry.get("httpResponse") or {}
-        mocked = not _is_forwarded_response(http_response)
-        if mocked_filter is not None and mocked != mocked_filter:
+ENTRY_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
+
+
+def _parse_entry_datetime(timestamp):
+    """Parses one of MockServer's own logged timestamps. Returns None if missing/malformed."""
+    if not timestamp:
+        return None
+    try:
+        return datetime.strptime(timestamp, ENTRY_TIMESTAMP_FORMAT)
+    except ValueError:
+        return None
+
+
+def _parse_query_datetime(value):
+    """Parses a developer-supplied from/to filter value (e.g. from an HTML datetime-local
+    input, "YYYY-MM-DDTHH:MM[:SS]") into a naive datetime. Returns None if empty/unparsable -
+    an invalid value is treated as "no bound" rather than a hard error, since this only narrows
+    a read-only view."""
+    if not value:
+        return None
+    normalized = value.strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
             continue
-        history.append(
-            {
-                "timestamp": entry.get("timestamp"),
-                "method": http_request.get("method"),
-                "path": http_request.get("path"),
-                "statusCode": http_response.get("statusCode"),
-                "mocked": mocked,
-                "requestHeaders": _multimap_to_pairs(http_request.get("headers")),
-                "requestBody": _observed_body(http_request.get("body")),
-                "responseHeaders": _multimap_to_pairs(http_response.get("headers")),
-                "responseBody": _observed_body(http_response.get("body")),
-            }
-        )
-    return history
+    return None
+
+
+def _matches_filters(entry, path_query, mocked_filter, from_dt, to_dt):
+    if path_query and path_query not in (entry["path"] or ""):
+        return False
+    if mocked_filter is not None and entry["mocked"] != mocked_filter:
+        return False
+    if from_dt is not None or to_dt is not None:
+        entry_dt = _parse_entry_datetime(entry["timestamp"])
+        if entry_dt is None:
+            return False
+        if from_dt is not None and entry_dt < from_dt:
+            return False
+        if to_dt is not None and entry_dt > to_dt:
+            return False
+    return True
+
+
+def _build_history_entry(raw_entry):
+    """Normalizes one raw MockServer REQUEST_RESPONSES log entry into what this page displays."""
+    http_request = raw_entry.get("httpRequest") or {}
+    http_response = raw_entry.get("httpResponse") or {}
+    return {
+        "timestamp": raw_entry.get("timestamp"),
+        "method": http_request.get("method"),
+        "path": http_request.get("path"),
+        "statusCode": http_response.get("statusCode"),
+        "mocked": not _is_forwarded_response(http_response),
+        "requestHeaders": _multimap_to_pairs(http_request.get("headers")),
+        "requestBody": _observed_body(http_request.get("body")),
+        "responseHeaders": _multimap_to_pairs(http_response.get("headers")),
+        "responseBody": _observed_body(http_response.get("body")),
+    }
+
+
+# --- shared history poller ---
+#
+# A single background thread fetches MockServer's full (unfiltered, unpaginated) request log
+# on REQUEST_STREAM_POLL_SECONDS cadence, regardless of how many browser tabs are open, and
+# every request/connection reads from this shared, continuously-rebuilt snapshot instead of
+# hitting MockServer itself. Previously each SSE connection polled MockServer independently -
+# with N open tabs that meant N re-fetches and N re-parses of the entire (potentially
+# multi-MB) log every second, which is what collapsed the page under concurrent viewers. See
+# docs/studies/2026-08-09-recent-requests-resilience.md for the full reproduction.
+#
+# The snapshot holds nothing MockServer doesn't already have and nothing survives past the next
+# tick, so this isn't the kind of independent cache the mocks CRUD flows are required to avoid -
+# see design.md in the improve-recent-requests-resilience change for why.
+_history_lock = threading.Lock()
+_history_snapshot = []
+
+
+def _poll_history_once():
+    try:
+        raw_entries = _mockserver_put("/mockserver/retrieve?type=REQUEST_RESPONSES", {}) or []
+    except MockServerError:
+        # Keep serving the previous snapshot rather than blanking it out on a transient failure.
+        return
+    built = [_build_history_entry(entry) for entry in raw_entries]
+    global _history_snapshot
+    with _history_lock:
+        _history_snapshot = built
+
+
+def _history_poller_loop():
+    while True:
+        _poll_history_once()
+        time.sleep(REQUEST_STREAM_POLL_SECONDS)
+
+
+def _get_history_snapshot():
+    with _history_lock:
+        return list(_history_snapshot)
 
 
 @app.get("/mock-ui/api/requests")
 def list_requests():
+    path_query = request.args.get("path")
     mocked_filter = _parse_mocked_filter(request.args.get("mocked"))
-    history = _fetch_request_history(request.args.get("path"), mocked_filter)
-    newest_first = list(reversed(history))
-    return jsonify(newest_first[:REQUEST_HISTORY_LIMIT])
+    from_dt = _parse_query_datetime(request.args.get("from"))
+    to_dt = _parse_query_datetime(request.args.get("to"))
+    before_cursor = request.args.get("before")
+
+    snapshot = _get_history_snapshot()
+    oldest_available_timestamp = snapshot[0]["timestamp"] if snapshot else None
+
+    filtered = [entry for entry in snapshot if _matches_filters(entry, path_query, mocked_filter, from_dt, to_dt)]
+    if before_cursor:
+        # Tie-break for entries sharing the exact same millisecond timestamp as the cursor:
+        # strict "<" means a same-timestamp sibling positioned before the cursor entry in
+        # MockServer's own return order could be skipped rather than shown on the next page.
+        # Documented, accepted known limitation (see design.md) rather than solved with a
+        # stable per-entry id - collisions at millisecond precision are rare at this scale.
+        filtered = [entry for entry in filtered if entry["timestamp"] < before_cursor]
+
+    has_more = len(filtered) > REQUEST_HISTORY_LIMIT
+    page = filtered[-REQUEST_HISTORY_LIMIT:]
+    newest_first = list(reversed(page))
+
+    oldest_available_dt = _parse_entry_datetime(oldest_available_timestamp)
+    range_truncated = bool(from_dt and oldest_available_dt and from_dt < oldest_available_dt)
+
+    return jsonify(
+        {
+            "entries": newest_first,
+            "hasMore": has_more,
+            "oldestAvailableTimestamp": oldest_available_timestamp,
+            "rangeTruncated": range_truncated,
+        }
+    )
 
 
 @app.get("/mock-ui/api/requests/stream")
 def stream_requests():
     path_query = request.args.get("path")
     mocked_filter = _parse_mocked_filter(request.args.get("mocked"))
+    # Deliberately no from/to here - a live-tailed entry is always "now," so a historical time
+    # range doesn't have a sensible reading against it. See design.md's "time range filter does
+    # not scope the live tail" decision.
 
     def event_stream():
-        # Start tailing from "now" - the page loads existing history separately
-        # via /mock-ui/api/requests, so the stream should only push genuinely
-        # new arrivals, not replay what was already fetched.
-        history = _fetch_request_history(path_query, mocked_filter)
-        last_timestamp = history[-1]["timestamp"] if history else ""
+        # Start tailing from "now" - the page loads existing history separately via
+        # /mock-ui/api/requests, so the stream should only push genuinely new arrivals. Reads
+        # the shared snapshot rather than polling MockServer itself - see the poller comment
+        # above.
+        snapshot = _get_history_snapshot()
+        last_timestamp = snapshot[-1]["timestamp"] if snapshot else ""
         while True:
             time.sleep(REQUEST_STREAM_POLL_SECONDS)
-            history = _fetch_request_history(path_query, mocked_filter)
-            new_entries = [entry for entry in history if entry["timestamp"] > last_timestamp]
+            snapshot = _get_history_snapshot()
+            new_entries = [
+                entry
+                for entry in snapshot
+                if entry["timestamp"] > last_timestamp and _matches_filters(entry, path_query, mocked_filter, None, None)
+            ]
             for entry in new_entries:
                 yield f"data: {json.dumps(entry)}\n\n"
             if new_entries:
@@ -346,6 +442,10 @@ def index():
 
 
 if __name__ == "__main__":
+    # Started here rather than at module import time so importing app.py (e.g. from
+    # test_app.py) doesn't spin up a thread that tries to reach MOCKSERVER_URL.
+    threading.Thread(target=_history_poller_loop, daemon=True).start()
+
     # Flask's dev server is fine for this POC's scale; threaded=True keeps
     # concurrent requests from serializing behind each other. A real
     # deployment would front this with a WSGI server (gunicorn/waitress)
