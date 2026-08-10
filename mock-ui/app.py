@@ -218,7 +218,7 @@ def delete_mock(mock_id):
     return "", 204
 
 
-REQUEST_HISTORY_LIMIT = 100
+REQUEST_HISTORY_LIMIT = 40
 REQUEST_STREAM_POLL_SECONDS = 1
 
 
