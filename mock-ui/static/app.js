@@ -320,6 +320,23 @@ function currentRequestsPathFilter() {
   return requestsPathFilter.value.trim();
 }
 
+function localDateTimeInputToUtcString(value) {
+  if (!value) {
+    return null;
+  }
+  // datetime-local values (e.g. "2026-08-09T14:30:00") parse as local wall-clock time;
+  // reformat via the UTC accessors into the naive-UTC string the backend expects.
+  const localDate = new Date(value);
+  if (Number.isNaN(localDate.getTime())) {
+    return null;
+  }
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    `${localDate.getUTCFullYear()}-${pad(localDate.getUTCMonth() + 1)}-${pad(localDate.getUTCDate())} ` +
+    `${pad(localDate.getUTCHours())}:${pad(localDate.getUTCMinutes())}:${pad(localDate.getUTCSeconds())}`
+  );
+}
+
 function requestsApiUrl(basePath, { before, includeTimeRange = true } = {}) {
   const params = new URLSearchParams();
   const path = currentRequestsPathFilter();
@@ -332,11 +349,13 @@ function requestsApiUrl(basePath, { before, includeTimeRange = true } = {}) {
   // The live tail (includeTimeRange: false) deliberately ignores from/to - a newly arriving
   // request is always "now," so a historical time range doesn't scope it. See design.md.
   if (includeTimeRange) {
-    if (requestsFromFilter.value) {
-      params.set("from", requestsFromFilter.value);
+    const fromUtc = localDateTimeInputToUtcString(requestsFromFilter.value);
+    if (fromUtc) {
+      params.set("from", fromUtc);
     }
-    if (requestsToFilter.value) {
-      params.set("to", requestsToFilter.value);
+    const toUtc = localDateTimeInputToUtcString(requestsToFilter.value);
+    if (toUtc) {
+      params.set("to", toUtc);
     }
   }
   if (before) {
@@ -356,6 +375,27 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function formatLocalTimestamp(rawUtcTimestamp) {
+  if (!rawUtcTimestamp) {
+    return rawUtcTimestamp;
+  }
+  // MockServer logs a naive "YYYY-MM-DD HH:MM:SS.ffffff" string that is actually UTC;
+  // treat it as such before letting the browser render it in the viewer's own time zone.
+  const parsed = new Date(rawUtcTimestamp.replace(" ", "T") + "Z");
+  if (Number.isNaN(parsed.getTime())) {
+    return rawUtcTimestamp;
+  }
+  return parsed.toLocaleString(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
 }
 
 function formatBody(body) {
@@ -414,7 +454,7 @@ function renderRequestRow(entry, detailRow) {
   const sourceLabel = entry.mocked ? "Mocked" : "Forwarded";
   const sourceClass = entry.mocked ? "requests-source-mocked" : "requests-source-forwarded";
   row.innerHTML = `
-    <td>${escapeHtml(entry.timestamp)}</td>
+    <td>${escapeHtml(formatLocalTimestamp(entry.timestamp))}</td>
     <td>${escapeHtml(entry.method)}</td>
     <td><code>${escapeHtml(entry.path)}</code></td>
     <td>${escapeHtml(entry.statusCode)}</td>
@@ -442,7 +482,7 @@ function updateRequestsPaginationUI() {
 
 function updateRequestsRangeTruncatedNotice(rangeTruncated, oldestAvailableTimestamp) {
   if (rangeTruncated && oldestAvailableTimestamp) {
-    requestsRangeTruncated.textContent = `Showing requests back to ${oldestAvailableTimestamp} - earlier requests are no longer retained by MockServer.`;
+    requestsRangeTruncated.textContent = `Showing requests back to ${formatLocalTimestamp(oldestAvailableTimestamp)} - earlier requests are no longer retained by MockServer.`;
     requestsRangeTruncated.hidden = false;
   } else {
     requestsRangeTruncated.hidden = true;
