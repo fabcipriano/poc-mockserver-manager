@@ -43,7 +43,14 @@ def _mockserver_put(path, body):
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             raw = resp.read()
-    except urllib.error.URLError as exc:
+    except OSError as exc:
+        # Catches both urllib.error.URLError (a URLError subclass) for connect-time failures
+        # and raw connection errors like ConnectionResetError that can surface mid-request if
+        # MockServer's pod is killed while a request is in flight - both are OSError subclasses.
+        # Previously only URLError was caught, so a mid-request reset (e.g. from a MockServer
+        # restart racing the shared history poller) crashed whatever caller was in flight; for
+        # the poller specifically, that permanently killed its background thread with no
+        # supervisor to restart it. See fix-recent-requests-stale-rows/design.md.
         raise MockServerError(502, f"could not reach MockServer: {exc}") from exc
     if not raw:
         return None
@@ -350,6 +357,28 @@ def _build_history_entry(raw_entry):
 # see design.md in the improve-recent-requests-resilience change for why.
 _history_lock = threading.Lock()
 _history_snapshot = []
+# Bumped whenever _poll_history_once detects MockServer's request/response log was reset (for
+# example, because MockServer itself restarted) - see _detect_history_reset. Open SSE
+# connections compare against their own last-seen value to notice a reset even when their own
+# connection to mock-ui never dropped. See design.md in fix-recent-requests-stale-rows.
+_history_reset_generation = 0
+
+
+def _detect_history_reset(previous_snapshot, new_snapshot):
+    """True if new_snapshot looks like MockServer's log was reset rather than just polled again.
+
+    MockServer's request log is append-only from the newest end and only evicts from the
+    oldest end, so a legitimate poll's newest entry should either match what we already saw or
+    be a genuinely later one still preceded by it. A reset instead makes the previously-newest
+    entry vanish entirely - either because the new snapshot is empty, or because it's non-empty
+    but doesn't contain that entry's timestamp anywhere.
+    """
+    if not previous_snapshot:
+        return False
+    if not new_snapshot:
+        return True
+    previous_newest_timestamp = previous_snapshot[-1]["timestamp"]
+    return not any(entry["timestamp"] == previous_newest_timestamp for entry in new_snapshot)
 
 
 def _poll_history_once():
@@ -362,21 +391,46 @@ def _poll_history_once():
         return
     latency = time.monotonic() - start
     built = [_build_history_entry(entry) for entry in raw_entries]
-    global _history_snapshot
+    global _history_snapshot, _history_reset_generation
     with _history_lock:
+        reset_detected = _detect_history_reset(_history_snapshot, built)
+        previous_count = len(_history_snapshot)
+        if reset_detected:
+            _history_reset_generation += 1
+        generation = _history_reset_generation
         _history_snapshot = built
+    if reset_detected:
+        logger.warning(
+            "history reset detected (generation now %d): previous snapshot had %d entries, new snapshot has %d entries",
+            generation,
+            previous_count,
+            len(built),
+        )
     logger.info("history poll succeeded in %.3fs (%d entries)", latency, len(built))
 
 
 def _history_poller_loop():
     while True:
-        _poll_history_once()
+        try:
+            _poll_history_once()
+        except Exception:
+            # _poll_history_once already handles the expected MockServerError case (logs and
+            # keeps serving the stale snapshot) - this is a last-resort backstop so *any* other
+            # unexpected exception can't silently kill this daemon thread and permanently freeze
+            # Recent Requests for the rest of this mock-ui process's life, with nothing left to
+            # ever retry MockServer again. See fix-recent-requests-stale-rows/design.md.
+            logger.exception("history poller tick failed unexpectedly - continuing")
         time.sleep(REQUEST_STREAM_POLL_SECONDS)
 
 
 def _get_history_snapshot():
     with _history_lock:
         return list(_history_snapshot)
+
+
+def _get_history_reset_generation():
+    with _history_lock:
+        return _history_reset_generation
 
 
 @app.get("/mock-ui/api/requests")
@@ -433,9 +487,27 @@ def stream_requests():
         snapshot = _get_history_snapshot()
         last_timestamp = snapshot[-1]["timestamp"] if snapshot else ""
         last_sent = time.monotonic()
+        # Initialized to the *current* generation so a freshly-opened connection never gets a
+        # reset notice for one that already happened before it connected.
+        last_seen_generation = _get_history_reset_generation()
         try:
             while True:
                 time.sleep(REQUEST_STREAM_POLL_SECONDS)
+                current_generation = _get_history_reset_generation()
+                if current_generation != last_seen_generation:
+                    # Named SSE event, not the heartbeat comment (invisible to EventSource) or
+                    # a regular data: message (which the client reads as one request entry) -
+                    # see design.md's signal-mechanism decision.
+                    yield "event: history-reset\ndata: {}\n\n"
+                    last_seen_generation = current_generation
+                    last_sent = time.monotonic()
+                    # The post-reset snapshot's entries are unrelated to what we've already
+                    # sent - resync last_timestamp to "now" so the live tail only resumes with
+                    # genuinely new entries going forward, instead of replaying the whole
+                    # post-reset log through the tail on top of the client's own resync fetch.
+                    snapshot = _get_history_snapshot()
+                    last_timestamp = snapshot[-1]["timestamp"] if snapshot else ""
+                    continue
                 snapshot = _get_history_snapshot()
                 new_entries = [
                     entry

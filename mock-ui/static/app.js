@@ -300,6 +300,7 @@ const requestsLoadMoreButton = document.getElementById("requests-load-more");
 const requestsNoMoreMessage = document.getElementById("requests-no-more");
 const requestsConnectionStatus = document.getElementById("requests-connection-status");
 const requestsConnectionStatusLabel = requestsConnectionStatus.querySelector(".connection-status-label");
+const requestsResyncNotice = document.getElementById("requests-resync-notice");
 
 let requestsEventSource = null;
 let requestsPaused = false;
@@ -309,6 +310,34 @@ let requestsOldestLoadedTimestamp = null;
 let requestsHasMore = false;
 let requestsReconnectTimer = null;
 let requestsReconnectAttempt = 0;
+let requestsResyncNoticeTimer = null;
+
+const REQUESTS_RESYNC_NOTICE_DURATION_MS = 6000;
+
+function showRequestsResyncNotice(reasonText) {
+  if (requestsResyncNoticeTimer) {
+    clearTimeout(requestsResyncNoticeTimer);
+  }
+  requestsResyncNotice.textContent = reasonText;
+  requestsResyncNotice.hidden = false;
+  requestsResyncNoticeTimer = setTimeout(() => {
+    requestsResyncNotice.hidden = true;
+    requestsResyncNoticeTimer = null;
+  }, REQUESTS_RESYNC_NOTICE_DURATION_MS);
+}
+
+// Shared by both the "reconnect succeeded" and "server detected a MockServer-side reset"
+// triggers - both need the same outcome: refresh the table from current server state and
+// tell the developer why. See design.md's "one shared resync helper" decision.
+async function resyncRequestsHistory(reasonText) {
+  console.log(`[requests] resyncing history: ${reasonText}`);
+  try {
+    await loadRequestHistory();
+    showRequestsResyncNotice(reasonText);
+  } catch (err) {
+    showRequestsError(err.message);
+  }
+}
 
 // Capped exponential backoff for live tail reconnection - see design.md's reconnection
 // decision. The connection never permanently gives up; Disconnected just means the last
@@ -586,16 +615,21 @@ function scheduleRequestsReconnect() {
   setRequestsConnectionState(requestsReconnectAttempt >= REQUESTS_DISCONNECTED_THRESHOLD ? "disconnected" : "reconnecting");
   requestsReconnectTimer = setTimeout(() => {
     requestsReconnectTimer = null;
-    connectRequestsStream();
+    connectRequestsStream(true);
   }, delay);
 }
 
-function connectRequestsStream() {
+function connectRequestsStream(isReconnect) {
   requestsEventSource = new EventSource(requestsApiUrl("/mock-ui/api/requests/stream", { includeTimeRange: false }));
   requestsEventSource.onopen = () => {
     console.log("[requests] live tail connected");
     requestsReconnectAttempt = 0;
     setRequestsConnectionState("live");
+    if (isReconnect) {
+      // The tail alone only resumes new arrivals - the table itself may still hold rows from
+      // before whatever caused the drop, so a reconnect also resyncs history. See design.md.
+      resyncRequestsHistory("Live tail reconnected - history refreshed to match MockServer's current state.");
+    }
   };
   requestsEventSource.onmessage = (event) => {
     const entry = JSON.parse(event.data);
@@ -605,6 +639,10 @@ function connectRequestsStream() {
       prependRequestRow(entry);
     }
   };
+  requestsEventSource.addEventListener("history-reset", () => {
+    console.log("[requests] server detected a MockServer-side history reset");
+    resyncRequestsHistory("MockServer's request history was reset - refreshed to match its current state.");
+  });
   requestsEventSource.onerror = () => {
     const readyState = requestsEventSource ? requestsEventSource.readyState : undefined;
     console.warn(`[requests] live tail connection error (readyState=${readyState})`);
@@ -620,7 +658,7 @@ function connectRequestsStream() {
 function openRequestsStream() {
   closeRequestsStream();
   setRequestsConnectionState("connecting");
-  connectRequestsStream();
+  connectRequestsStream(false);
 }
 
 function syncRequestsPageStream(page) {
