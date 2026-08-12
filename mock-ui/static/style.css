@@ -11,6 +11,7 @@
   --color-surface-alt: #ffffff;
   --color-border: #e2d6d3;
   --color-danger: #a12f43;
+  --color-success: #2f7a4f;
   --color-text: #2b0f16;
   --color-text-muted: #7a6a66;
 
@@ -351,6 +352,58 @@ tbody tr:last-child td {
 }
 
 /* --- recent requests page --- */
+
+.requests-connection-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 0.75rem;
+  color: var(--color-text-muted);
+}
+
+.connection-status-dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: var(--color-text-muted);
+}
+
+.requests-connection-status[data-state="live"] {
+  color: var(--color-success);
+}
+
+.requests-connection-status[data-state="live"] .connection-status-dot {
+  background: var(--color-success);
+}
+
+.requests-connection-status[data-state="reconnecting"] {
+  color: var(--color-accent-dark);
+}
+
+.requests-connection-status[data-state="reconnecting"] .connection-status-dot {
+  background: var(--color-accent);
+  animation: connection-status-pulse 1s ease-in-out infinite;
+}
+
+.requests-connection-status[data-state="disconnected"] {
+  color: var(--color-danger);
+}
+
+.requests-connection-status[data-state="disconnected"] .connection-status-dot {
+  background: var(--color-danger);
+}
+
+@keyframes connection-status-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
 
 .requests-toolbar {
   display: flex;

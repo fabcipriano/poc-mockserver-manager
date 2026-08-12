@@ -133,6 +133,11 @@
         <h1>Recent Requests</h1>
         <p class="page-intro">Every request MockServer has received, mocked or not, live from MockServer itself - nothing cached by this page. History is lost if the MockServer pod restarts.</p>
 
+        <div class="requests-connection-status" id="requests-connection-status" data-state="connecting">
+          <span class="connection-status-dot" aria-hidden="true"></span>
+          <span class="connection-status-label">Connecting…</span>
+        </div>
+
         <div class="requests-toolbar">
           <label class="requests-filter-label">
             Filter by path
@@ -219,6 +224,11 @@
         <article class="help-article">
           <h2>Request body (JSON)</h2>
           <p>Constrain the mock to requests whose JSON body matches what you specify. Choose <strong>"Contains at least these fields"</strong> to match any request body that includes the fields you listed (extra fields are ignored), or <strong>"Exact match"</strong> to require the request body to be exactly what you specified, with nothing extra.</p>
+        </article>
+
+        <article class="help-article">
+          <h2>Live tail connection status</h2>
+          <p>The Recent Requests page shows a small connection-status indicator: <strong>Live</strong> means the live tail is connected and newly received requests will appear without a refresh; <strong>Reconnecting</strong> means the connection was lost and the page is retrying automatically; <strong>Disconnected</strong> means several reconnect attempts in a row have failed, though the page keeps retrying in the background. If it stays Disconnected, check the mock-ui server's logs first (it logs every live-tail connect/disconnect and every attempt to poll MockServer for history, including failures) - that will usually show whether MockServer itself is unreachable or something in front of mock-ui (a load balancer, proxy, or the pod itself) is dropping the connection.</p>
         </article>
 
         <article class="help-article">

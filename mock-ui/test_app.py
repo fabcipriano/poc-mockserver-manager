@@ -1,6 +1,8 @@
 import unittest
+from unittest.mock import patch
 
-from app import _is_forwarded_response
+import app as app_module
+from app import MockServerError, _is_forwarded_response
 
 
 class IsForwardedResponseTests(unittest.TestCase):
@@ -38,6 +40,36 @@ class IsForwardedResponseTests(unittest.TestCase):
 
     def test_response_with_no_headers_or_reason_phrase_is_not_forwarded(self):
         self.assertFalse(_is_forwarded_response({"statusCode": 404}))
+
+
+class HistoryPollerLoggingTests(unittest.TestCase):
+    def test_successful_poll_is_logged(self):
+        with patch.object(app_module, "_mockserver_put", return_value=[]):
+            with self.assertLogs("mock-ui", level="INFO") as captured:
+                app_module._poll_history_once()
+        self.assertTrue(any("history poll succeeded" in message for message in captured.output))
+
+    def test_failed_poll_is_logged(self):
+        with patch.object(app_module, "_mockserver_put", side_effect=MockServerError(502, "could not reach MockServer")):
+            with self.assertLogs("mock-ui", level="WARNING") as captured:
+                app_module._poll_history_once()
+        self.assertTrue(any("history poll failed" in message for message in captured.output))
+
+
+class StreamHeartbeatTests(unittest.TestCase):
+    def test_heartbeat_is_sent_on_an_idle_stream(self):
+        # Zeroing both intervals means the very first tick has nothing new to send and the
+        # heartbeat threshold is already crossed, without the test sleeping for real.
+        with patch.object(app_module, "REQUEST_STREAM_POLL_SECONDS", 0), patch.object(
+            app_module, "HEARTBEAT_INTERVAL_SECONDS", 0
+        ):
+            client = app_module.app.test_client()
+            response = client.get("/mock-ui/api/requests/stream")
+            chunk = next(response.response)
+            response.response.close()
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode("utf-8")
+        self.assertEqual(chunk, ": ping\n\n")
 
 
 if __name__ == "__main__":

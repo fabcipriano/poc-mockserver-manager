@@ -298,6 +298,8 @@ const requestsError = document.getElementById("requests-error");
 const requestsRangeTruncated = document.getElementById("requests-range-truncated");
 const requestsLoadMoreButton = document.getElementById("requests-load-more");
 const requestsNoMoreMessage = document.getElementById("requests-no-more");
+const requestsConnectionStatus = document.getElementById("requests-connection-status");
+const requestsConnectionStatusLabel = requestsConnectionStatus.querySelector(".connection-status-label");
 
 let requestsEventSource = null;
 let requestsPaused = false;
@@ -305,6 +307,26 @@ let requestsPendingQueue = [];
 let requestsFilterDebounce = null;
 let requestsOldestLoadedTimestamp = null;
 let requestsHasMore = false;
+let requestsReconnectTimer = null;
+let requestsReconnectAttempt = 0;
+
+// Capped exponential backoff for live tail reconnection - see design.md's reconnection
+// decision. The connection never permanently gives up; Disconnected just means the last
+// several attempts failed, while attempts keep retrying in the background.
+const REQUESTS_RECONNECT_BASE_DELAY_MS = 1000;
+const REQUESTS_RECONNECT_MAX_DELAY_MS = 30000;
+const REQUESTS_DISCONNECTED_THRESHOLD = 5;
+const REQUESTS_CONNECTION_STATE_LABELS = {
+  connecting: "Connecting…",
+  live: "Live",
+  reconnecting: "Reconnecting…",
+  disconnected: "Disconnected",
+};
+
+function setRequestsConnectionState(state) {
+  requestsConnectionStatus.dataset.state = state;
+  requestsConnectionStatusLabel.textContent = REQUESTS_CONNECTION_STATE_LABELS[state];
+}
 
 function showRequestsError(message) {
   requestsError.textContent = message;
@@ -541,15 +563,40 @@ async function loadMoreRequests() {
 }
 
 function closeRequestsStream() {
+  if (requestsReconnectTimer) {
+    clearTimeout(requestsReconnectTimer);
+    requestsReconnectTimer = null;
+  }
   if (requestsEventSource) {
+    console.log("[requests] closing live tail connection");
+    requestsEventSource.onerror = null;
     requestsEventSource.close();
     requestsEventSource = null;
   }
+  requestsReconnectAttempt = 0;
 }
 
-function openRequestsStream() {
-  closeRequestsStream();
+function scheduleRequestsReconnect() {
+  requestsReconnectAttempt += 1;
+  const delay = Math.min(
+    REQUESTS_RECONNECT_BASE_DELAY_MS * 2 ** (requestsReconnectAttempt - 1),
+    REQUESTS_RECONNECT_MAX_DELAY_MS,
+  );
+  console.log(`[requests] scheduling live tail reconnect attempt ${requestsReconnectAttempt} in ${delay}ms`);
+  setRequestsConnectionState(requestsReconnectAttempt >= REQUESTS_DISCONNECTED_THRESHOLD ? "disconnected" : "reconnecting");
+  requestsReconnectTimer = setTimeout(() => {
+    requestsReconnectTimer = null;
+    connectRequestsStream();
+  }, delay);
+}
+
+function connectRequestsStream() {
   requestsEventSource = new EventSource(requestsApiUrl("/mock-ui/api/requests/stream", { includeTimeRange: false }));
+  requestsEventSource.onopen = () => {
+    console.log("[requests] live tail connected");
+    requestsReconnectAttempt = 0;
+    setRequestsConnectionState("live");
+  };
   requestsEventSource.onmessage = (event) => {
     const entry = JSON.parse(event.data);
     if (requestsPaused) {
@@ -559,8 +606,21 @@ function openRequestsStream() {
     }
   };
   requestsEventSource.onerror = () => {
-    showRequestsError("Lost connection to the live request stream. Reopen the Recent Requests page to reconnect.");
+    const readyState = requestsEventSource ? requestsEventSource.readyState : undefined;
+    console.warn(`[requests] live tail connection error (readyState=${readyState})`);
+    if (requestsEventSource) {
+      requestsEventSource.onerror = null;
+      requestsEventSource.close();
+      requestsEventSource = null;
+    }
+    scheduleRequestsReconnect();
   };
+}
+
+function openRequestsStream() {
+  closeRequestsStream();
+  setRequestsConnectionState("connecting");
+  connectRequestsStream();
 }
 
 function syncRequestsPageStream(page) {

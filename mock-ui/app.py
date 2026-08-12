@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import threading
 import time
@@ -7,6 +8,12 @@ import urllib.request
 from datetime import datetime
 
 from flask import Flask, Response, jsonify, request, send_from_directory
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("mock-ui")
 
 MOCKSERVER_URL = os.environ.get("MOCKSERVER_URL", "http://mockserver")
 
@@ -220,6 +227,10 @@ def delete_mock(mock_id):
 
 REQUEST_HISTORY_LIMIT = 40
 REQUEST_STREAM_POLL_SECONDS = 1
+# Comfortably under typical proxy/ALB idle-connection timeouts (commonly ~60s by default),
+# so a live tail with no new requests never goes long enough without a byte on the wire to
+# look idle to an intermediate proxy. See design.md's heartbeat decision.
+HEARTBEAT_INTERVAL_SECONDS = 15
 
 
 def _observed_body(body):
@@ -342,15 +353,19 @@ _history_snapshot = []
 
 
 def _poll_history_once():
+    start = time.monotonic()
     try:
         raw_entries = _mockserver_put("/mockserver/retrieve?type=REQUEST_RESPONSES", {}) or []
-    except MockServerError:
+    except MockServerError as exc:
         # Keep serving the previous snapshot rather than blanking it out on a transient failure.
+        logger.warning("history poll failed after %.3fs: %s", time.monotonic() - start, exc)
         return
+    latency = time.monotonic() - start
     built = [_build_history_entry(entry) for entry in raw_entries]
     global _history_snapshot
     with _history_lock:
         _history_snapshot = built
+    logger.info("history poll succeeded in %.3fs (%d entries)", latency, len(built))
 
 
 def _history_poller_loop():
@@ -414,20 +429,31 @@ def stream_requests():
         # /mock-ui/api/requests, so the stream should only push genuinely new arrivals. Reads
         # the shared snapshot rather than polling MockServer itself - see the poller comment
         # above.
+        logger.info("SSE client connected (path=%r, mocked=%r)", path_query, mocked_filter)
         snapshot = _get_history_snapshot()
         last_timestamp = snapshot[-1]["timestamp"] if snapshot else ""
-        while True:
-            time.sleep(REQUEST_STREAM_POLL_SECONDS)
-            snapshot = _get_history_snapshot()
-            new_entries = [
-                entry
-                for entry in snapshot
-                if entry["timestamp"] > last_timestamp and _matches_filters(entry, path_query, mocked_filter, None, None)
-            ]
-            for entry in new_entries:
-                yield f"data: {json.dumps(entry)}\n\n"
-            if new_entries:
-                last_timestamp = new_entries[-1]["timestamp"]
+        last_sent = time.monotonic()
+        try:
+            while True:
+                time.sleep(REQUEST_STREAM_POLL_SECONDS)
+                snapshot = _get_history_snapshot()
+                new_entries = [
+                    entry
+                    for entry in snapshot
+                    if entry["timestamp"] > last_timestamp and _matches_filters(entry, path_query, mocked_filter, None, None)
+                ]
+                for entry in new_entries:
+                    yield f"data: {json.dumps(entry)}\n\n"
+                    last_sent = time.monotonic()
+                if new_entries:
+                    last_timestamp = new_entries[-1]["timestamp"]
+                elif time.monotonic() - last_sent >= HEARTBEAT_INTERVAL_SECONDS:
+                    # SSE comment line: ignored by EventSource.onmessage, but keeps bytes
+                    # flowing so an idle-connection timeout in front of us never trips.
+                    yield ": ping\n\n"
+                    last_sent = time.monotonic()
+        finally:
+            logger.info("SSE client disconnected (path=%r, mocked=%r)", path_query, mocked_filter)
 
     return Response(
         event_stream(),
