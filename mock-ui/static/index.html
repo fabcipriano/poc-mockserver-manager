@@ -17,6 +17,7 @@
         <li><a href="#list" class="nav-link" data-page="list">List Mocks</a></li>
         <li><a href="#requests" class="nav-link" data-page="requests">Recent Requests</a></li>
         <li><a href="#help" class="nav-link" data-page="help">Help</a></li>
+        <li><a href="/mockserver/dashboard" target="_blank" rel="noopener" class="nav-link nav-link-external" data-page="mockserver-dashboard">MockServer Dashboard <span class="nav-link-external-icon" aria-hidden="true">&#8599;</span></a></li>
       </ul>
     </nav>
 
@@ -218,6 +219,11 @@
         <article class="help-article">
           <h2>Request body (JSON)</h2>
           <p>Constrain the mock to requests whose JSON body matches what you specify. Choose <strong>"Contains at least these fields"</strong> to match any request body that includes the fields you listed (extra fields are ignored), or <strong>"Exact match"</strong> to require the request body to be exactly what you specified, with nothing extra.</p>
+        </article>
+
+        <article class="help-article">
+          <h2>MockServer Dashboard</h2>
+          <p>The <strong>MockServer Dashboard</strong> link in the sidebar opens MockServer's own dashboard in a new tab. Reach for it when a mock isn't matching and you need to know why: it shows the matching diagnostics for each request - which specific matcher property did or didn't match - which Recent Requests doesn't show. It's a separate vendor tool, not a page this web interface owns or keeps working, and like everything else in this environment it has no authentication.</p>
         </article>
       </section>
     </main>
