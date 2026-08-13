@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-public
+  labels:
+    app: backend-public
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-public
+  template:
+    metadata:
+      labels:
+        app: backend-public
+    spec:
+      containers:
+        - name: backend-public
+          image: mockserver-poc/backend-public:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 3
+            periodSeconds: 5

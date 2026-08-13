@@ -15,7 +15,69 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mock-ui")
 
-MOCKSERVER_URL = os.environ.get("MOCKSERVER_URL", "http://mockserver")
+
+class Target:
+    """One configured MockServer instance: its identity plus its own history-poller state.
+
+    The history-poller fields (lock/snapshot/reset generation) used to be module-level
+    globals shared by a single implicit target; each Target now owns its own, so N
+    configured targets get N independent shared snapshots polled by N independent
+    threads - see design.md's "per-target poller" decision.
+    """
+
+    def __init__(self, target_id, label, url):
+        self.id = target_id
+        self.label = label
+        self.url = url
+        self.history_lock = threading.Lock()
+        self.history_snapshot = []
+        self.history_reset_generation = 0
+
+
+def _parse_targets():
+    """Builds the configured Target list from MOCKSERVER_TARGETS, or a single
+    MOCKSERVER_URL-based fallback target when it's unset - see design.md's
+    "Configuration shape" decision for the migration rationale."""
+    raw = os.environ.get("MOCKSERVER_TARGETS")
+    if not raw:
+        url = os.environ.get("MOCKSERVER_URL", "http://mockserver")
+        return [Target("default", "Default", url)]
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"MOCKSERVER_TARGETS is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, list) or not parsed:
+        raise ValueError("MOCKSERVER_TARGETS must be a non-empty JSON array")
+
+    targets = []
+    seen_ids = set()
+    for index, entry in enumerate(parsed):
+        if not isinstance(entry, dict):
+            raise ValueError(f"MOCKSERVER_TARGETS[{index}] must be a JSON object")
+        missing = [field for field in ("id", "label", "url") if not entry.get(field)]
+        if missing:
+            raise ValueError(f"MOCKSERVER_TARGETS[{index}] missing required field(s): {', '.join(missing)}")
+        target_id = entry["id"]
+        if target_id in seen_ids:
+            raise ValueError(f"MOCKSERVER_TARGETS has a duplicate id: {target_id!r}")
+        seen_ids.add(target_id)
+        targets.append(Target(target_id, entry["label"], entry["url"]))
+    return targets
+
+
+try:
+    TARGETS = _parse_targets()
+except ValueError as exc:
+    # Fail fast and loud at startup rather than serve a partially-broken target list -
+    # see design.md's "Risks / Trade-offs".
+    logger.error("invalid MOCKSERVER_TARGETS configuration: %s", exc)
+    raise SystemExit(1) from exc
+
+TARGETS_BY_ID = {target.id: target for target in TARGETS}
+# Used whenever a caller omits ?server= - the first configured target, so existing
+# direct API callers that don't know about multi-target keep working. See design.md.
+DEFAULT_TARGET = TARGETS[0]
 
 # Convention shared with scripts/add-mock.sh: the seeded catch-all forwarding
 # expectation always sits at priority 0, every dev-created mock at priority 10.
@@ -32,10 +94,23 @@ class MockServerError(Exception):
         self.message = message
 
 
-def _mockserver_put(path, body):
+def _resolve_target():
+    """Resolves the ?server= query param against TARGETS_BY_ID, defaulting to
+    DEFAULT_TARGET when omitted; raises a 404 MockServerError for an unknown id."""
+    server_id = request.args.get("server")
+    if server_id is None:
+        return DEFAULT_TARGET
+    target = TARGETS_BY_ID.get(server_id)
+    if target is None:
+        known = ", ".join(TARGETS_BY_ID)
+        raise MockServerError(404, f"unknown server {server_id!r}; known servers: {known}")
+    return target
+
+
+def _mockserver_put(target, path, body):
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
-        f"{MOCKSERVER_URL}{path}",
+        f"{target.url}{path}",
         data=data,
         method="PUT",
         headers={"Content-Type": "application/json"},
@@ -195,9 +270,15 @@ def healthz():
     return "ok", 200
 
 
+@app.get("/mock-ui/api/servers")
+def list_servers():
+    return jsonify([{"id": target.id, "label": target.label} for target in TARGETS])
+
+
 @app.get("/mock-ui/api/mocks")
 def list_mocks():
-    expectations = _mockserver_put("/mockserver/retrieve?type=ACTIVE_EXPECTATIONS", {}) or []
+    target = _resolve_target()
+    expectations = _mockserver_put(target, "/mockserver/retrieve?type=ACTIVE_EXPECTATIONS", {}) or []
     mocks = [
         to_friendly(expectation)
         for expectation in expectations
@@ -208,9 +289,10 @@ def list_mocks():
 
 @app.post("/mock-ui/api/mocks")
 def create_mock():
+    target = _resolve_target()
     payload = request.get_json(force=True, silent=True) or {}
     expectation = to_expectation(payload)
-    created = _mockserver_put("/mockserver/expectation", expectation)
+    created = _mockserver_put(target, "/mockserver/expectation", expectation)
     if not created:
         raise MockServerError(502, "MockServer did not return the created expectation")
     return jsonify(to_friendly(created[0])), 201
@@ -218,9 +300,10 @@ def create_mock():
 
 @app.put("/mock-ui/api/mocks/<mock_id>")
 def update_mock(mock_id):
+    target = _resolve_target()
     payload = request.get_json(force=True, silent=True) or {}
     expectation = to_expectation(payload, expectation_id=mock_id)
-    updated = _mockserver_put("/mockserver/expectation", expectation)
+    updated = _mockserver_put(target, "/mockserver/expectation", expectation)
     if not updated:
         raise MockServerError(502, "MockServer did not return the updated expectation")
     return jsonify(to_friendly(updated[0]))
@@ -228,7 +311,8 @@ def update_mock(mock_id):
 
 @app.delete("/mock-ui/api/mocks/<mock_id>")
 def delete_mock(mock_id):
-    _mockserver_put("/mockserver/clear", {"id": mock_id})
+    target = _resolve_target()
+    _mockserver_put(target, "/mockserver/clear", {"id": mock_id})
     return "", 204
 
 
@@ -344,24 +428,19 @@ def _build_history_entry(raw_entry):
 
 # --- shared history poller ---
 #
-# A single background thread fetches MockServer's full (unfiltered, unpaginated) request log
-# on REQUEST_STREAM_POLL_SECONDS cadence, regardless of how many browser tabs are open, and
-# every request/connection reads from this shared, continuously-rebuilt snapshot instead of
-# hitting MockServer itself. Previously each SSE connection polled MockServer independently -
-# with N open tabs that meant N re-fetches and N re-parses of the entire (potentially
-# multi-MB) log every second, which is what collapsed the page under concurrent viewers. See
-# docs/studies/2026-08-09-recent-requests-resilience.md for the full reproduction.
+# One background thread per configured Target fetches that target's full (unfiltered,
+# unpaginated) request log on REQUEST_STREAM_POLL_SECONDS cadence, regardless of how many
+# browser tabs are open, and every request/connection reads from that target's shared,
+# continuously-rebuilt snapshot instead of hitting MockServer itself. Previously each SSE
+# connection polled MockServer independently - with N open tabs that meant N re-fetches and N
+# re-parses of the entire (potentially multi-MB) log every second, which is what collapsed the
+# page under concurrent viewers. See docs/studies/2026-08-09-recent-requests-resilience.md for
+# the full reproduction, and design.md's "per-target poller" decision for why this is now one
+# thread per target rather than one thread total.
 #
 # The snapshot holds nothing MockServer doesn't already have and nothing survives past the next
 # tick, so this isn't the kind of independent cache the mocks CRUD flows are required to avoid -
 # see design.md in the improve-recent-requests-resilience change for why.
-_history_lock = threading.Lock()
-_history_snapshot = []
-# Bumped whenever _poll_history_once detects MockServer's request/response log was reset (for
-# example, because MockServer itself restarted) - see _detect_history_reset. Open SSE
-# connections compare against their own last-seen value to notice a reset even when their own
-# connection to mock-ui never dropped. See design.md in fix-recent-requests-stale-rows.
-_history_reset_generation = 0
 
 
 def _detect_history_reset(previous_snapshot, new_snapshot):
@@ -381,67 +460,68 @@ def _detect_history_reset(previous_snapshot, new_snapshot):
     return not any(entry["timestamp"] == previous_newest_timestamp for entry in new_snapshot)
 
 
-def _poll_history_once():
+def _poll_history_once(target):
     start = time.monotonic()
     try:
-        raw_entries = _mockserver_put("/mockserver/retrieve?type=REQUEST_RESPONSES", {}) or []
+        raw_entries = _mockserver_put(target, "/mockserver/retrieve?type=REQUEST_RESPONSES", {}) or []
     except MockServerError as exc:
         # Keep serving the previous snapshot rather than blanking it out on a transient failure.
-        logger.warning("history poll failed after %.3fs: %s", time.monotonic() - start, exc)
+        logger.warning("history poll failed for target %s after %.3fs: %s", target.id, time.monotonic() - start, exc)
         return
     latency = time.monotonic() - start
     built = [_build_history_entry(entry) for entry in raw_entries]
-    global _history_snapshot, _history_reset_generation
-    with _history_lock:
-        reset_detected = _detect_history_reset(_history_snapshot, built)
-        previous_count = len(_history_snapshot)
+    with target.history_lock:
+        reset_detected = _detect_history_reset(target.history_snapshot, built)
+        previous_count = len(target.history_snapshot)
         if reset_detected:
-            _history_reset_generation += 1
-        generation = _history_reset_generation
-        _history_snapshot = built
+            target.history_reset_generation += 1
+        generation = target.history_reset_generation
+        target.history_snapshot = built
     if reset_detected:
         logger.warning(
-            "history reset detected (generation now %d): previous snapshot had %d entries, new snapshot has %d entries",
+            "history reset detected for target %s (generation now %d): previous snapshot had %d entries, new snapshot has %d entries",
+            target.id,
             generation,
             previous_count,
             len(built),
         )
-    logger.info("history poll succeeded in %.3fs (%d entries)", latency, len(built))
+    logger.info("history poll succeeded for target %s in %.3fs (%d entries)", target.id, latency, len(built))
 
 
-def _history_poller_loop():
+def _history_poller_loop(target):
     while True:
         try:
-            _poll_history_once()
+            _poll_history_once(target)
         except Exception:
             # _poll_history_once already handles the expected MockServerError case (logs and
             # keeps serving the stale snapshot) - this is a last-resort backstop so *any* other
             # unexpected exception can't silently kill this daemon thread and permanently freeze
             # Recent Requests for the rest of this mock-ui process's life, with nothing left to
             # ever retry MockServer again. See fix-recent-requests-stale-rows/design.md.
-            logger.exception("history poller tick failed unexpectedly - continuing")
+            logger.exception("history poller tick failed unexpectedly for target %s - continuing", target.id)
         time.sleep(REQUEST_STREAM_POLL_SECONDS)
 
 
-def _get_history_snapshot():
-    with _history_lock:
-        return list(_history_snapshot)
+def _get_history_snapshot(target):
+    with target.history_lock:
+        return list(target.history_snapshot)
 
 
-def _get_history_reset_generation():
-    with _history_lock:
-        return _history_reset_generation
+def _get_history_reset_generation(target):
+    with target.history_lock:
+        return target.history_reset_generation
 
 
 @app.get("/mock-ui/api/requests")
 def list_requests():
+    target = _resolve_target()
     path_query = request.args.get("path")
     mocked_filter = _parse_mocked_filter(request.args.get("mocked"))
     from_dt = _parse_query_datetime(request.args.get("from"))
     to_dt = _parse_query_datetime(request.args.get("to"))
     before_cursor = request.args.get("before")
 
-    snapshot = _get_history_snapshot()
+    snapshot = _get_history_snapshot(target)
     oldest_available_timestamp = snapshot[0]["timestamp"] if snapshot else None
 
     filtered = [entry for entry in snapshot if _matches_filters(entry, path_query, mocked_filter, from_dt, to_dt)]
@@ -472,6 +552,7 @@ def list_requests():
 
 @app.get("/mock-ui/api/requests/stream")
 def stream_requests():
+    target = _resolve_target()
     path_query = request.args.get("path")
     mocked_filter = _parse_mocked_filter(request.args.get("mocked"))
     # Deliberately no from/to here - a live-tailed entry is always "now," so a historical time
@@ -483,17 +564,17 @@ def stream_requests():
         # /mock-ui/api/requests, so the stream should only push genuinely new arrivals. Reads
         # the shared snapshot rather than polling MockServer itself - see the poller comment
         # above.
-        logger.info("SSE client connected (path=%r, mocked=%r)", path_query, mocked_filter)
-        snapshot = _get_history_snapshot()
+        logger.info("SSE client connected (target=%s, path=%r, mocked=%r)", target.id, path_query, mocked_filter)
+        snapshot = _get_history_snapshot(target)
         last_timestamp = snapshot[-1]["timestamp"] if snapshot else ""
         last_sent = time.monotonic()
         # Initialized to the *current* generation so a freshly-opened connection never gets a
         # reset notice for one that already happened before it connected.
-        last_seen_generation = _get_history_reset_generation()
+        last_seen_generation = _get_history_reset_generation(target)
         try:
             while True:
                 time.sleep(REQUEST_STREAM_POLL_SECONDS)
-                current_generation = _get_history_reset_generation()
+                current_generation = _get_history_reset_generation(target)
                 if current_generation != last_seen_generation:
                     # Named SSE event, not the heartbeat comment (invisible to EventSource) or
                     # a regular data: message (which the client reads as one request entry) -
@@ -505,10 +586,10 @@ def stream_requests():
                     # sent - resync last_timestamp to "now" so the live tail only resumes with
                     # genuinely new entries going forward, instead of replaying the whole
                     # post-reset log through the tail on top of the client's own resync fetch.
-                    snapshot = _get_history_snapshot()
+                    snapshot = _get_history_snapshot(target)
                     last_timestamp = snapshot[-1]["timestamp"] if snapshot else ""
                     continue
-                snapshot = _get_history_snapshot()
+                snapshot = _get_history_snapshot(target)
                 new_entries = [
                     entry
                     for entry in snapshot
@@ -525,7 +606,7 @@ def stream_requests():
                     yield ": ping\n\n"
                     last_sent = time.monotonic()
         finally:
-            logger.info("SSE client disconnected (path=%r, mocked=%r)", path_query, mocked_filter)
+            logger.info("SSE client disconnected (target=%s, path=%r, mocked=%r)", target.id, path_query, mocked_filter)
 
     return Response(
         event_stream(),
@@ -541,8 +622,10 @@ def index():
 
 if __name__ == "__main__":
     # Started here rather than at module import time so importing app.py (e.g. from
-    # test_app.py) doesn't spin up a thread that tries to reach MOCKSERVER_URL.
-    threading.Thread(target=_history_poller_loop, daemon=True).start()
+    # test_app.py) doesn't spin up threads that try to reach any configured target. One daemon
+    # thread per configured target - see design.md's "per-target poller" decision.
+    for mockserver_target in TARGETS:
+        threading.Thread(target=_history_poller_loop, args=(mockserver_target,), daemon=True).start()
 
     # Flask's dev server is fine for this POC's scale; threaded=True keeps
     # concurrent requests from serializing behind each other. A real

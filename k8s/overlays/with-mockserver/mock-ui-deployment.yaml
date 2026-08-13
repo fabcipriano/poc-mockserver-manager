@@ -19,8 +19,14 @@ spec:
           image: mockserver-poc/mock-ui:local
           imagePullPolicy: IfNotPresent
           env:
-            - name: MOCKSERVER_URL
-              value: "http://mockserver"
+            # One entry per configured MockServer instance (id/label/url) - see
+            # design.md's "Configuration shape" decision. Adding, removing, or repointing a
+            # target only requires editing this value and restarting the pod, no rebuild.
+            - name: MOCKSERVER_TARGETS
+              value: >-
+                [{"id":"public","label":"Gateway Public","url":"http://mockserver-public"},
+                {"id":"private","label":"Gateway Private","url":"http://mockserver-private"},
+                {"id":"product","label":"Gateway Product","url":"http://mockserver"}]
           ports:
             - containerPort: 8000
           readinessProbe:

@@ -1,8 +1,4 @@
-## Purpose
-
-Provide a self-contained Kubernetes environment that emulates the production request path (ALB -> NodeJS Gateway -> Spring Boot Backend) so the MockServer integration can be proven and demoed without touching real infrastructure.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Emulated topology mirrors production request path
 The system SHALL provide Kubernetes manifests that stand up three independent emulated topologies, mirroring production's three gateways (public, private, product), each wired in the same relative order as production so a single external request entering that topology's entrypoint reaches its backend only by passing through MockServer and, for the product topology, a Gateway stand-in:
@@ -28,13 +24,6 @@ The product topology's Backend stand-in SHALL run the real, unmodified [restful-
 - **WHEN** the emulated environment is running with no outbound internet access from the cluster
 - **THEN** the product topology's Backend stand-in continues to serve requests, because it is deployed in-cluster from a container image rather than proxying to an externally hosted instance
 
-### Requirement: Gateway stand-in forwards requests without altering them
-The Gateway stand-in SHALL forward incoming requests to the Backend stand-in's Kubernetes Service address, preserving method, path, and body, without requiring route-specific configuration for the sample endpoints.
-
-#### Scenario: Gateway stand-in passes a request through unchanged
-- **WHEN** the Gateway stand-in receives a request for a route it is configured to proxy
-- **THEN** it forwards the same method, path, and body to the Backend stand-in and relays the Backend stand-in's response back to the caller
-
 ### Requirement: Environment installs and tears down with minimal steps
 The system SHALL allow a developer to bring up all three emulated topologies (public, private, product) in a local Kubernetes cluster with a single documented command sequence, and tear them down completely with another.
 
@@ -45,6 +34,8 @@ The system SHALL allow a developer to bring up all three emulated topologies (pu
 #### Scenario: Full teardown
 - **WHEN** a developer runs the documented uninstall command(s)
 - **THEN** all resources created for all three emulated topologies are removed from the cluster
+
+## ADDED Requirements
 
 ### Requirement: Public and private topologies use simplified NodeJS backends returning a hardcoded API
 The public and private topologies' Backend stand-ins SHALL each be a small NodeJS service, distinct from each other and from the product topology's restful-booker backend, that answers at least one route with a fixed, hardcoded JSON response rather than proxying to or embedding a real upstream application.

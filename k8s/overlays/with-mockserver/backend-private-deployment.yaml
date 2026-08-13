@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-private
+  labels:
+    app: backend-private
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-private
+  template:
+    metadata:
+      labels:
+        app: backend-private
+    spec:
+      containers:
+        - name: backend-private
+          image: mockserver-poc/backend-private:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 3
+            periodSeconds: 5

@@ -9,6 +9,18 @@ resources:
   - mockserver-service.yaml
   - mockserver-configmap.yaml
   - mockserver-pvc.yaml
+  - backend-public-deployment.yaml
+  - backend-public-service.yaml
+  - backend-private-deployment.yaml
+  - backend-private-service.yaml
+  - mockserver-public-deployment.yaml
+  - mockserver-public-service.yaml
+  - mockserver-public-configmap.yaml
+  - mockserver-public-pvc.yaml
+  - mockserver-private-deployment.yaml
+  - mockserver-private-service.yaml
+  - mockserver-private-configmap.yaml
+  - mockserver-private-pvc.yaml
   - mock-ui-deployment.yaml
   - mock-ui-service.yaml
 

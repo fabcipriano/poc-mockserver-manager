@@ -13,6 +13,25 @@ spec:
                 name: mock-ui
                 port:
                   number: 80
+          # The public and private topologies are only reachable at these dedicated prefixes -
+          # production has genuinely separate entrypoints per gateway; this POC uses one Ingress
+          # with a prefix per topology instead. See design.md/poc-environment spec.md. Listed
+          # before the unprefixed "/" catch-all below so they take precedence over it.
+          - path: /public
+            pathType: Prefix
+            backend:
+              service:
+                name: mockserver-public
+                port:
+                  number: 80
+          - path: /private
+            pathType: Prefix
+            backend:
+              service:
+                name: mockserver-private
+                port:
+                  number: 80
+          # Unprefixed - the product topology, unchanged from before this change.
           - path: /
             pathType: Prefix
             backend:

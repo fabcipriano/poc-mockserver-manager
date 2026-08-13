@@ -1,0 +1,13 @@
+{
+  "name": "backend-private",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal NodeJS backend stand-in for the private MockServer topology, returning a hardcoded JSON API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

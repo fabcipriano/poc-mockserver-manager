@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-private
+  labels:
+    app: backend-private
+spec:
+  selector:
+    app: backend-private
+  ports:
+    - port: 80
+      targetPort: 3000

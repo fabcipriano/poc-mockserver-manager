@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mockserver-private
+  labels:
+    app: mockserver-private
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mockserver-private
+  template:
+    metadata:
+      labels:
+        app: mockserver-private
+    spec:
+      # See mockserver-deployment.yaml (the product topology's instance) for why fsGroup is
+      # kept even though kind's local-path StorageClass doesn't honor it for hostPath volumes.
+      securityContext:
+        fsGroup: 65532
+      initContainers:
+        - name: seed-persisted-expectations
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              if [ ! -f /data/persistedExpectations.json ]; then
+                echo "Seeding /data/persistedExpectations.json from the catch-all ConfigMap..."
+                cp /config/initializerJson.json /data/persistedExpectations.json
+              else
+                echo "/data/persistedExpectations.json already present, leaving it alone."
+              fi
+              chmod 666 /data/persistedExpectations.json
+          volumeMounts:
+            - name: init-config
+              mountPath: /config
+              readOnly: true
+            - name: data
+              mountPath: /data
+      containers:
+        - name: mockserver
+          image: mockserver/mockserver:5.15.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MOCKSERVER_SERVER_PORT
+              value: "1080"
+            - name: MOCKSERVER_INITIALIZATION_JSON_PATH
+              value: "/data/persistedExpectations.json"
+            - name: MOCKSERVER_PERSIST_EXPECTATIONS
+              value: "true"
+            - name: MOCKSERVER_PERSISTED_EXPECTATIONS_PATH
+              value: "/data/persistedExpectations.json"
+            - name: MOCKSERVER_LOG_LEVEL
+              value: "INFO"
+          ports:
+            - containerPort: 1080
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            tcpSocket:
+              port: 1080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: init-config
+          configMap:
+            name: mockserver-private-init
+        - name: data
+          persistentVolumeClaim:
+            claimName: mockserver-private-data

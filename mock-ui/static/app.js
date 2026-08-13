@@ -1,4 +1,7 @@
 const API_BASE = "/mock-ui/api/mocks";
+const SERVERS_API = "/mock-ui/api/servers";
+
+const serverSelect = document.getElementById("server-select");
 
 const form = document.getElementById("mock-form");
 const formTitle = document.getElementById("form-title");
@@ -31,6 +34,70 @@ const refreshButton = document.getElementById("refresh-button");
 const successBanner = document.getElementById("success-banner");
 const successBannerText = document.getElementById("success-banner-text");
 const successBannerDismiss = document.getElementById("success-banner-dismiss");
+
+// --- MockServer target selection ---
+//
+// The selected target is kept in the `server` URL query param (not localStorage) so it's
+// visible, shareable, and consistent with how page routing already works via location.hash -
+// see design.md's "Frontend: a persistent target selector" decision.
+
+let currentServer = null;
+
+function withServer(url) {
+  if (!currentServer) {
+    return url;
+  }
+  const params = new URLSearchParams();
+  params.set("server", currentServer);
+  const query = params.toString();
+  return url.includes("?") ? `${url}&${query}` : `${url}?${query}`;
+}
+
+function serverIdFromUrl() {
+  return new URLSearchParams(window.location.search).get("server");
+}
+
+function updateServerInUrl(serverId) {
+  const url = new URL(window.location.href);
+  url.searchParams.set("server", serverId);
+  history.replaceState(null, "", url.toString());
+}
+
+async function loadServers() {
+  const response = await fetch(SERVERS_API);
+  if (!response.ok) {
+    throw new Error(`failed to load MockServer targets: ${response.status}`);
+  }
+  const servers = await response.json();
+
+  serverSelect.innerHTML = "";
+  for (const server of servers) {
+    const option = document.createElement("option");
+    option.value = server.id;
+    option.textContent = server.label;
+    serverSelect.appendChild(option);
+  }
+
+  const requestedServer = serverIdFromUrl();
+  const knownIds = servers.map((server) => server.id);
+  currentServer = knownIds.includes(requestedServer) ? requestedServer : (servers[0] ? servers[0].id : null);
+  serverSelect.value = currentServer;
+  if (currentServer) {
+    updateServerInUrl(currentServer);
+  }
+}
+
+function onServerChanged() {
+  currentServer = serverSelect.value;
+  updateServerInUrl(currentServer);
+  resetForm();
+  loadMocks().catch((err) => showError(err.message));
+  if (getCurrentPageFromHash() === "requests") {
+    reloadRequestsForFilterChange();
+  }
+}
+
+serverSelect.addEventListener("change", onServerChanged);
 
 // --- navigation ---
 
@@ -192,7 +259,7 @@ function renderMocks(mocks) {
 }
 
 async function loadMocks() {
-  const response = await fetch(API_BASE);
+  const response = await fetch(withServer(API_BASE));
   if (!response.ok) {
     throw new Error(`failed to list mocks: ${response.status}`);
   }
@@ -204,7 +271,7 @@ async function deleteMock(id) {
   if (!window.confirm("Delete this mock? This can't be undone.")) {
     return;
   }
-  const response = await fetch(`${API_BASE}/${encodeURIComponent(id)}`, { method: "DELETE" });
+  const response = await fetch(withServer(`${API_BASE}/${encodeURIComponent(id)}`), { method: "DELETE" });
   if (!response.ok && response.status !== 204) {
     throw new Error(`failed to delete mock: ${response.status}`);
   }
@@ -257,7 +324,7 @@ form.addEventListener("submit", async (event) => {
   }
 
   const editingId = idField.value;
-  const url = editingId ? `${API_BASE}/${encodeURIComponent(editingId)}` : API_BASE;
+  const url = withServer(editingId ? `${API_BASE}/${encodeURIComponent(editingId)}` : API_BASE);
   const method = editingId ? "PUT" : "POST";
 
   const response = await fetch(url, {
@@ -390,6 +457,9 @@ function localDateTimeInputToUtcString(value) {
 
 function requestsApiUrl(basePath, { before, includeTimeRange = true } = {}) {
   const params = new URLSearchParams();
+  if (currentServer) {
+    params.set("server", currentServer);
+  }
   const path = currentRequestsPathFilter();
   if (path) {
     params.set("path", path);
@@ -707,7 +777,16 @@ requestsLoadMoreButton.addEventListener("click", () => {
   loadMoreRequests().catch((err) => showRequestsError(err.message));
 });
 
-const initialPage = getCurrentPageFromHash();
-showPage(initialPage);
-syncRequestsPageStream(initialPage);
-loadMocks().catch((err) => showError(err.message));
+async function init() {
+  try {
+    await loadServers();
+  } catch (err) {
+    showError(err.message);
+  }
+  const initialPage = getCurrentPageFromHash();
+  showPage(initialPage);
+  syncRequestsPageStream(initialPage);
+  loadMocks().catch((err) => showError(err.message));
+}
+
+init();
