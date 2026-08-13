@@ -27,6 +27,15 @@ spec:
                 [{"id":"public","label":"Gateway Public","url":"http://mockserver-public"},
                 {"id":"private","label":"Gateway Private","url":"http://mockserver-private"},
                 {"id":"product","label":"Gateway Product","url":"http://mockserver"}]
+            # Recent Requests page size, live-tail poll cadence, and SSE heartbeat cadence -
+            # values below match mock-ui's built-in defaults, set explicitly so this manifest
+            # doubles as a working example of every tunable a migration needs to carry over.
+            - name: REQUEST_HISTORY_LIMIT
+              value: "40"
+            - name: REQUEST_STREAM_POLL_SECONDS
+              value: "1"
+            - name: HEARTBEAT_INTERVAL_SECONDS
+              value: "15"
           ports:
             - containerPort: 8000
           readinessProbe:

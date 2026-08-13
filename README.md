@@ -155,7 +155,27 @@ the UI keeps no cache or copy of its own. It's a thin Python/Flask app (`mock-ui
 MockServer REST API `scripts/add-mock.sh` and friends use, so both ways of managing mocks work side by side
 against the same live state.
 
-### Configuring which MockServer instances mock-ui can reach
+### Configuring mock-ui
+
+`mock-ui` is configured entirely through environment variables read once at process startup, so migrating
+it to a different environment - a different cluster, a different set of MockServer instances, different
+traffic volume - is a configuration change, not a code change or image rebuild. All five variables are set
+in `k8s/overlays/with-mockserver/mock-ui-deployment.yaml`; that file doubles as a working example.
+
+| Variable | Default | Controls |
+| --- | --- | --- |
+| `MOCKSERVER_TARGETS` | *(unset)* | JSON array of `{"id", "label", "url"}` objects - the MockServer instances the selector lists. See below. |
+| `MOCKSERVER_URL` | `http://mockserver` | Single-target fallback URL, used only when `MOCKSERVER_TARGETS` is unset. See below. |
+| `REQUEST_HISTORY_LIMIT` | `40` | Recent Requests page size - how many requests one page/load-more fetch returns. |
+| `REQUEST_STREAM_POLL_SECONDS` | `1` | How often (in seconds) the background poller re-checks each target's MockServer for new requests. |
+| `HEARTBEAT_INTERVAL_SECONDS` | `15` | How often (in seconds) an idle live-tail connection sends a keep-alive event, to stay under typical proxy/ALB idle-connection timeouts. |
+
+`REQUEST_HISTORY_LIMIT`, `REQUEST_STREAM_POLL_SECONDS`, and `HEARTBEAT_INTERVAL_SECONDS` each accept a
+positive integer; an unset variable keeps its default, and an invalid value (non-integer, zero, or
+negative) fails `mock-ui` startup immediately with a specific error, rather than starting with an unusable
+setting.
+
+#### Configuring which MockServer instances mock-ui can reach
 
 `mock-ui` reads its list of MockServer targets from the `MOCKSERVER_TARGETS` environment variable at
 startup - a JSON array of `{"id", "label", "url"}` objects, one per instance:
@@ -172,7 +192,9 @@ Adding, removing, or repointing a target only requires changing this value (see
 `k8s/overlays/with-mockserver/mock-ui-deployment.yaml`) and restarting the pod - no code change or image
 rebuild. If `MOCKSERVER_TARGETS` is unset, `mock-ui` falls back to a single target built from the older
 `MOCKSERVER_URL` variable (default `http://mockserver`), so an existing single-server deployment keeps
-working unchanged.
+working unchanged. Because this POC's manifest always sets `MOCKSERVER_TARGETS`, `MOCKSERVER_URL` has no
+effect there today - it only matters for a deployment that intentionally omits `MOCKSERVER_TARGETS` in
+favor of a single fixed MockServer.
 
 ## Mock persistence
 

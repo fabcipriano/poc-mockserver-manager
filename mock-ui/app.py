@@ -316,12 +316,31 @@ def delete_mock(mock_id):
     return "", 204
 
 
-REQUEST_HISTORY_LIMIT = 40
-REQUEST_STREAM_POLL_SECONDS = 1
-# Comfortably under typical proxy/ALB idle-connection timeouts (commonly ~60s by default),
-# so a live tail with no new requests never goes long enough without a byte on the wire to
-# look idle to an intermediate proxy. See design.md's heartbeat decision.
-HEARTBEAT_INTERVAL_SECONDS = 15
+def _parse_positive_int_env(name, default):
+    """Reads a positive-integer runtime setting from the environment, or its
+    default when unset - same fail-fast convention as MOCKSERVER_TARGETS above."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+    return value
+
+
+try:
+    REQUEST_HISTORY_LIMIT = _parse_positive_int_env("REQUEST_HISTORY_LIMIT", 40)
+    REQUEST_STREAM_POLL_SECONDS = _parse_positive_int_env("REQUEST_STREAM_POLL_SECONDS", 1)
+    # Comfortably under typical proxy/ALB idle-connection timeouts (commonly ~60s by default),
+    # so a live tail with no new requests never goes long enough without a byte on the wire to
+    # look idle to an intermediate proxy. See design.md's heartbeat decision.
+    HEARTBEAT_INTERVAL_SECONDS = _parse_positive_int_env("HEARTBEAT_INTERVAL_SECONDS", 15)
+except ValueError as exc:
+    logger.error("invalid mock-ui runtime configuration: %s", exc)
+    raise SystemExit(1) from exc
 
 
 def _observed_body(body):

@@ -270,5 +270,33 @@ class ServerResolutionTests(unittest.TestCase):
         self.assertIs(called_target, app_module.DEFAULT_TARGET)
 
 
+class RuntimeConfigParsingTests(unittest.TestCase):
+    def test_returns_default_when_unset(self):
+        with patch.dict(os.environ, {}):
+            os.environ.pop("REQUEST_HISTORY_LIMIT", None)
+            value = app_module._parse_positive_int_env("REQUEST_HISTORY_LIMIT", 40)
+        self.assertEqual(value, 40)
+
+    def test_override_takes_effect(self):
+        with patch.dict(os.environ, {"REQUEST_HISTORY_LIMIT": "100"}):
+            value = app_module._parse_positive_int_env("REQUEST_HISTORY_LIMIT", 40)
+        self.assertEqual(value, 100)
+
+    def test_non_integer_raises(self):
+        with patch.dict(os.environ, {"HEARTBEAT_INTERVAL_SECONDS": "soon"}):
+            with self.assertRaises(ValueError):
+                app_module._parse_positive_int_env("HEARTBEAT_INTERVAL_SECONDS", 15)
+
+    def test_zero_raises(self):
+        with patch.dict(os.environ, {"REQUEST_STREAM_POLL_SECONDS": "0"}):
+            with self.assertRaises(ValueError):
+                app_module._parse_positive_int_env("REQUEST_STREAM_POLL_SECONDS", 1)
+
+    def test_negative_raises(self):
+        with patch.dict(os.environ, {"REQUEST_STREAM_POLL_SECONDS": "-1"}):
+            with self.assertRaises(ValueError):
+                app_module._parse_positive_int_env("REQUEST_STREAM_POLL_SECONDS", 1)
+
+
 if __name__ == "__main__":
     unittest.main()
