@@ -1,6 +1,7 @@
+import json
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import app as app_module
 from app import MockServerError, Target, _is_forwarded_response
@@ -296,6 +297,163 @@ class RuntimeConfigParsingTests(unittest.TestCase):
         with patch.dict(os.environ, {"REQUEST_STREAM_POLL_SECONDS": "-1"}):
             with self.assertRaises(ValueError):
                 app_module._parse_positive_int_env("REQUEST_STREAM_POLL_SECONDS", 1)
+
+
+def _fake_bedrock_client(response_text):
+    client = MagicMock()
+    client.converse.return_value = {"output": {"message": {"content": [{"text": response_text}]}}}
+    return client
+
+
+SAMPLE_SOURCE_ENTRY = {
+    "timestamp": "2026-08-14 10:00:00.000000",
+    "method": "GET",
+    "path": "/booking/1",
+    "statusCode": 200,
+    "mocked": False,
+    "requestHeaders": [],
+    "requestBody": None,
+    "responseHeaders": [],
+    "responseBody": {"firstname": "Ada"},
+}
+
+
+class MockGenerationDraftEndpointTests(unittest.TestCase):
+    def test_rejects_empty_source_entries(self):
+        client = app_module.app.test_client()
+        response = client.post("/mock-ui/api/mock-generation/draft", json={"sourceEntries": [], "mode": "edge-cases"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("sourceEntries", response.get_json()["error"])
+
+    def test_rejects_oversized_source_entries(self):
+        oversized = [SAMPLE_SOURCE_ENTRY] * (app_module.MOCK_GENERATION_MAX_SOURCE_ENTRIES + 1)
+        client = app_module.app.test_client()
+        response = client.post("/mock-ui/api/mock-generation/draft", json={"sourceEntries": oversized, "mode": "edge-cases"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("at most", response.get_json()["error"])
+
+    def test_rejects_invalid_mode(self):
+        client = app_module.app.test_client()
+        response = client.post(
+            "/mock-ui/api/mock-generation/draft",
+            json={"sourceEntries": [SAMPLE_SOURCE_ENTRY], "mode": "not-a-real-mode"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("mode must be one of", response.get_json()["error"])
+
+    def test_returns_error_when_unavailable(self):
+        with patch.object(app_module, "_bedrock_client", None):
+            client = app_module.app.test_client()
+            response = client.post(
+                "/mock-ui/api/mock-generation/draft",
+                json={"sourceEntries": [SAMPLE_SOURCE_ENTRY], "mode": "edge-cases"},
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("not configured", response.get_json()["error"])
+
+    def test_malformed_llm_json_is_a_failed_generation_attempt(self):
+        with patch.object(app_module, "_bedrock_client", _fake_bedrock_client("not valid json")):
+            client = app_module.app.test_client()
+            response = client.post(
+                "/mock-ui/api/mock-generation/draft",
+                json={"sourceEntries": [SAMPLE_SOURCE_ENTRY], "mode": "edge-cases"},
+            )
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("could not be parsed", response.get_json()["error"])
+
+    def test_splits_valid_and_invalid_candidates(self):
+        raw_items = [
+            {"method": "GET", "path": "/booking/1", "statusCode": 404, "responseBody": {"error": "not found"}},
+            {"method": "GET", "responseBody": {}},  # missing required "path" and "statusCode"
+        ]
+        with patch.object(app_module, "_bedrock_client", _fake_bedrock_client(json.dumps(raw_items))):
+            client = app_module.app.test_client()
+            response = client.post(
+                "/mock-ui/api/mock-generation/draft",
+                json={"sourceEntries": [SAMPLE_SOURCE_ENTRY], "mode": "edge-cases"},
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(len(body["candidates"]), 1)
+        self.assertEqual(body["candidates"][0]["path"], "/booking/1")
+        self.assertEqual(len(body["rejected"]), 1)
+        self.assertIn("missing required field", body["rejected"][0]["reason"])
+
+
+class MockGenerationLoadEndpointTests(unittest.TestCase):
+    def test_rejects_empty_mocks_list(self):
+        client = app_module.app.test_client()
+        response = client.post("/mock-ui/api/mock-generation/load", json={"mocks": []})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("mocks", response.get_json()["error"])
+
+    def test_valid_mocks_load_through_existing_mockserver_put_path(self):
+        created_expectation = {
+            "id": "abc123",
+            "httpRequest": {"method": "GET", "path": "/booking/1"},
+            "httpResponse": {"statusCode": 200, "body": {"firstname": "Ada"}},
+        }
+        with patch.object(app_module, "_mockserver_put", return_value=[created_expectation]) as mock_put:
+            client = app_module.app.test_client()
+            response = client.post(
+                "/mock-ui/api/mock-generation/load",
+                json={"mocks": [{"method": "GET", "path": "/booking/1", "statusCode": 200, "responseBody": {"firstname": "Ada"}}]},
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(len(body["loaded"]), 1)
+        self.assertEqual(body["loaded"][0]["id"], "abc123")
+        self.assertEqual(len(body["rejected"]), 0)
+        put_args = mock_put.call_args[0]
+        self.assertIs(put_args[0], app_module.DEFAULT_TARGET)
+        self.assertEqual(put_args[1], "/mockserver/expectation")
+
+    def test_invalid_mock_is_rejected_without_failing_whole_batch(self):
+        created_expectation = {
+            "id": "abc123",
+            "httpRequest": {"method": "GET", "path": "/booking/1"},
+            "httpResponse": {"statusCode": 200, "body": {}},
+        }
+        with patch.object(app_module, "_mockserver_put", return_value=[created_expectation]):
+            client = app_module.app.test_client()
+            response = client.post(
+                "/mock-ui/api/mock-generation/load",
+                json={
+                    "mocks": [
+                        {"method": "GET", "path": "/booking/1", "statusCode": 200, "responseBody": {}},
+                        {"method": "GET", "responseBody": {}},  # missing required fields
+                    ]
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(len(body["loaded"]), 1)
+        self.assertEqual(len(body["rejected"]), 1)
+        self.assertIn("missing required field", body["rejected"][0]["reason"])
+
+
+class MockGenerationAvailabilityTests(unittest.TestCase):
+    def test_status_reports_unavailable_without_model_id(self):
+        with patch.object(app_module, "_bedrock_client", None):
+            client = app_module.app.test_client()
+            response = client.get("/mock-ui/api/mock-generation/status")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"available": False})
+
+    def test_draft_endpoint_fails_cleanly_without_model_id(self):
+        with patch.object(app_module, "_bedrock_client", None):
+            client = app_module.app.test_client()
+            response = client.post(
+                "/mock-ui/api/mock-generation/draft",
+                json={"sourceEntries": [SAMPLE_SOURCE_ENTRY], "mode": "edge-cases"},
+            )
+        self.assertEqual(response.status_code, 503)
+
+    def test_app_still_serves_existing_routes_without_model_id(self):
+        with patch.object(app_module, "_bedrock_client", None):
+            client = app_module.app.test_client()
+            response = client.get("/mock-ui/healthz")
+        self.assertEqual(response.status_code, 200)
 
 
 if __name__ == "__main__":

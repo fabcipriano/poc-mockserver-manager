@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
+import boto3
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 logging.basicConfig(
@@ -314,6 +315,205 @@ def delete_mock(mock_id):
     target = _resolve_target()
     _mockserver_put(target, "/mockserver/clear", {"id": mock_id})
     return "", 204
+
+
+# --- AI mock generation ---
+#
+# Turns a developer-selected set of captured Recent Requests entries into LLM-drafted candidate
+# mocks, in the same "friendly" shape create_mock/update_mock already accept - so to_expectation's
+# required-field validation and the existing MockServer write path are the only place a candidate
+# is ever checked or loaded, never a second parallel implementation. See design.md's "Candidate
+# schema mirrors the existing friendly mock shape exactly" decision.
+#
+# Unlike MOCKSERVER_TARGETS/the runtime timing settings, a missing BEDROCK_MODEL_ID does not fail
+# startup - it just leaves this one feature unavailable, since the rest of mock-ui works fine
+# without it. See design.md's "Configuration: fail open, not fail fast" decision.
+#
+# AWS credentials themselves are never read here - boto3 resolves them lazily from its own
+# standard chain (env vars, shared config file, an instance profile, or IRSA) on first call. See
+# design.md's "AWS credential handling in deployment" decision.
+
+BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID")
+AWS_REGION = os.environ.get("AWS_REGION") or None
+MOCK_GENERATION_MAX_SOURCE_ENTRIES = 25
+MOCK_GENERATION_MODES = {"edge-cases", "from-recordings"}
+
+
+def _build_bedrock_client():
+    if not BEDROCK_MODEL_ID:
+        return None
+    try:
+        return boto3.client("bedrock-runtime", region_name=AWS_REGION)
+    except Exception:
+        # Client construction itself can fail loudly (e.g. no AWS region resolvable anywhere) -
+        # this feature must fail open even then, so catch broadly and just leave it unavailable
+        # rather than crash mock-ui startup.
+        logger.exception("failed to construct Bedrock client - AI mock generation will be unavailable")
+        return None
+
+
+_bedrock_client = _build_bedrock_client()
+
+
+class MockGenerationError(MockServerError):
+    """Distinct from a MockServer-reported failure, but reuses MockServerError's
+    status_code/message shape and errorhandler - Flask matches error handlers by walking the
+    exception's MRO, so registering only MockServerError's handler still catches this."""
+
+
+def _mock_generation_available():
+    return _bedrock_client is not None
+
+
+@app.get("/mock-ui/api/mock-generation/status")
+def mock_generation_status():
+    return jsonify({"available": _mock_generation_available()})
+
+
+MOCK_GENERATION_SYSTEM_PROMPT = (
+    "You draft MockServer mock expectations for a developer's API-mocking tool. Respond with ONLY "
+    "a JSON array (no prose, no markdown code fences) of candidate mock objects."
+)
+
+
+def _build_mock_generation_prompt(source_entries, mode):
+    corpus = json.dumps(source_entries, indent=2)
+    if mode == "edge-cases":
+        task = (
+            "Given the captured request/response pairs below, draft ADDITIONAL MockServer mock "
+            "expectations covering plausible edge cases NOT already present in the captures - "
+            "validation errors, auth failures, not-found responses, boundary values, and similar - "
+            "shaped consistently with the response conventions (status codes, error envelope shape, "
+            "header style) observed in the captures. Do not just repeat the captured entries verbatim."
+        )
+    else:
+        task = (
+            "Given the captured request/response pairs below, draft one MockServer mock expectation "
+            "for each one, reproducing its method, path, status code, and response body as a static mock."
+        )
+    return f"""{task}
+
+Captured traffic (JSON array of {{method, path, statusCode, requestHeaders, requestBody, responseHeaders, responseBody}}):
+{corpus}
+
+Each candidate object must use exactly this shape:
+{{
+  "method": "GET",
+  "path": "/example/{{id}}",
+  "statusCode": 200,
+  "responseBody": {{}},
+  "requestBody": null,
+  "requestBodyMatchType": "ONLY_MATCHING_FIELDS",
+  "pathParameters": [{{"name": "id", "value": "123"}}],
+  "queryStringParameters": [],
+  "headers": [],
+  "cookies": []
+}}
+
+"method", "path", and "statusCode" are required on every object. Omit or null out fields that don't apply.
+"""
+
+
+def _call_bedrock_for_mock_candidates(source_entries, mode):
+    if not _mock_generation_available():
+        raise MockGenerationError(503, "AI mock generation is not configured on this deployment")
+
+    prompt = _build_mock_generation_prompt(source_entries, mode)
+    try:
+        # Converse presents the same request/response shape across every model family Bedrock
+        # hosts, so BEDROCK_MODEL_ID is the only thing that changes to use a different model -
+        # see design.md's "AWS Bedrock via boto3's Converse API" decision.
+        response = _bedrock_client.converse(
+            modelId=BEDROCK_MODEL_ID,
+            system=[{"text": MOCK_GENERATION_SYSTEM_PROMPT}],
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": 4096},
+        )
+    except Exception as exc:
+        # Deliberately logs only the exception's own message, never the request we sent (which
+        # would never contain AWS credentials themselves, but keep this conservative regardless) -
+        # see design.md's credential-leakage risk/mitigation. Covers missing/invalid AWS
+        # credentials, missing Bedrock model access, and any other Bedrock API error alike.
+        logger.warning("Bedrock mock generation call failed: %s", exc)
+        raise MockGenerationError(502, "AI mock generation request failed") from exc
+
+    content_blocks = response.get("output", {}).get("message", {}).get("content", [])
+    text = "".join(block.get("text", "") for block in content_blocks if "text" in block)
+    try:
+        raw_items = json.loads(text)
+    except json.JSONDecodeError as exc:
+        logger.warning("Bedrock mock generation returned unparseable JSON: %s", exc)
+        raise MockGenerationError(502, "AI response could not be parsed as JSON") from exc
+    return raw_items
+
+
+def _split_candidates_and_rejections(raw_items):
+    """Runs each LLM-drafted item through to_expectation's own required-field validation - the
+    same check a manually created mock goes through - splitting the response into loadable
+    candidates and rejected items (with a reason), before anything is shown to the developer as
+    approvable. See design.md's "Validation happens before showing candidates" decision."""
+    if not isinstance(raw_items, list):
+        raise MockGenerationError(502, "AI response was not a JSON array of candidate mocks")
+
+    candidates = []
+    rejected = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            rejected.append({"raw": raw, "reason": "candidate was not a JSON object"})
+            continue
+        try:
+            to_expectation(raw)
+        except MockServerError as exc:
+            rejected.append({"raw": raw, "reason": exc.message})
+            continue
+        candidates.append(raw)
+    return candidates, rejected
+
+
+@app.post("/mock-ui/api/mock-generation/draft")
+def draft_mock_generation():
+    payload = request.get_json(force=True, silent=True) or {}
+    source_entries = payload.get("sourceEntries")
+    mode = payload.get("mode", "edge-cases")
+
+    if mode not in MOCK_GENERATION_MODES:
+        raise MockGenerationError(400, f"mode must be one of: {', '.join(sorted(MOCK_GENERATION_MODES))}")
+    if not isinstance(source_entries, list) or not source_entries:
+        raise MockGenerationError(400, "sourceEntries must be a non-empty array of captured requests")
+    if len(source_entries) > MOCK_GENERATION_MAX_SOURCE_ENTRIES:
+        raise MockGenerationError(
+            400,
+            f"sourceEntries must contain at most {MOCK_GENERATION_MAX_SOURCE_ENTRIES} entries per generation run",
+        )
+
+    raw_items = _call_bedrock_for_mock_candidates(source_entries, mode)
+    candidates, rejected = _split_candidates_and_rejections(raw_items)
+    return jsonify({"candidates": candidates, "rejected": rejected})
+
+
+@app.post("/mock-ui/api/mock-generation/load")
+def load_mock_generation():
+    target = _resolve_target()
+    payload = request.get_json(force=True, silent=True) or {}
+    mocks = payload.get("mocks")
+    if not isinstance(mocks, list) or not mocks:
+        raise MockGenerationError(400, "mocks must be a non-empty array of candidate mocks")
+
+    loaded = []
+    rejected = []
+    for raw in mocks:
+        try:
+            expectation = to_expectation(raw)
+        except MockServerError as exc:
+            rejected.append({"raw": raw, "reason": exc.message})
+            continue
+        created = _mockserver_put(target, "/mockserver/expectation", expectation)
+        if not created:
+            rejected.append({"raw": raw, "reason": "MockServer did not return the created expectation"})
+            continue
+        loaded.append(to_friendly(created[0]))
+
+    return jsonify({"loaded": loaded, "rejected": rejected})
 
 
 def _parse_positive_int_env(name, default):

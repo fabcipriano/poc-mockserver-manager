@@ -36,6 +36,37 @@ spec:
               value: "1"
             - name: HEARTBEAT_INTERVAL_SECONDS
               value: "15"
+            # Enables the AI Mock Generator page, backed by AWS Bedrock - see README's "Configuring
+            # AI mock generation" section. BEDROCK_MODEL_ID/AWS_REGION are plain config, not
+            # secrets. mock-ui fails open (not closed) when BEDROCK_MODEL_ID is unset - see
+            # design.md in openspec/changes/add-llm-mock-generation.
+            # Cross-region inference profile ID, not the bare foundation model ID - this model
+            # only supports INFERENCE_PROFILE invocation on Bedrock (confirmed against a real
+            # account: the bare "anthropic.claude-sonnet-4-5-20250929-v1:0" model ID fails with
+            # "on-demand throughput isn't supported" - see design.md's inference-profile risk).
+            - name: BEDROCK_MODEL_ID
+              value: "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+            - name: AWS_REGION
+              value: "us-east-1"
+            # AWS credentials for the Bedrock call. Prefer an IAM role (IRSA on EKS, or an
+            # instance profile) instead of these - that needs no env vars at all, since boto3
+            # picks up role credentials automatically. These two are this POC's fallback for a
+            # local cluster with no such role: deliberately not backed by a committed Secret
+            # manifest - create the mock-ui-aws-credentials Secret out of band so a real key pair
+            # is never something `git add` can pick up. `optional: true` means a cluster with no
+            # such Secret (e.g. one that does have an IAM role instead) still deploys cleanly.
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: mock-ui-aws-credentials
+                  key: access-key-id
+                  optional: true
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mock-ui-aws-credentials
+                  key: secret-access-key
+                  optional: true
           ports:
             - containerPort: 8000
           readinessProbe:

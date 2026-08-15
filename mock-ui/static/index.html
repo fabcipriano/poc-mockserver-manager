@@ -20,6 +20,7 @@
         <li><a href="#create" class="nav-link" data-page="create">Create Mock</a></li>
         <li><a href="#list" class="nav-link" data-page="list">List Mocks</a></li>
         <li><a href="#requests" class="nav-link" data-page="requests">Recent Requests</a></li>
+        <li><a href="#generate" class="nav-link" data-page="generate" id="nav-generate" hidden>AI Mock Generator</a></li>
         <li><a href="#help" class="nav-link" data-page="help">Help</a></li>
         <li><a href="/mockserver/dashboard" target="_blank" rel="noopener" class="nav-link nav-link-external" data-page="mockserver-dashboard">MockServer Dashboard <span class="nav-link-external-icon" aria-hidden="true">&#8599;</span></a></li>
       </ul>
@@ -189,6 +190,66 @@
         <div class="requests-pagination">
           <button type="button" id="requests-load-more" hidden>Load more</button>
           <p id="requests-no-more" class="requests-empty-note" hidden>No older requests available.</p>
+        </div>
+      </section>
+
+      <section id="page-generate" class="page">
+        <h1>AI Mock Generator</h1>
+        <p class="page-intro">Turn a selection of captured Recent Requests into LLM-drafted mock expectations. Nothing is loaded into MockServer until you review and approve it below.</p>
+
+        <p id="generate-unavailable" class="requests-empty-note" hidden>AI mock generation isn't configured for this deployment (no AWS Bedrock model configured), so this page is unavailable.</p>
+
+        <div id="generate-available-content">
+          <div class="table-card">
+            <table id="generate-source-table">
+              <thead>
+                <tr>
+                  <th></th>
+                  <th>Method</th>
+                  <th>Path</th>
+                  <th>Status</th>
+                  <th>Source</th>
+                </tr>
+              </thead>
+              <tbody id="generate-source-body"></tbody>
+            </table>
+          </div>
+          <p id="generate-source-empty" hidden>No captured requests yet for this target. Visit <a href="#requests">Recent Requests</a> to generate some traffic first.</p>
+
+          <div class="generate-toolbar">
+            <span id="generate-selection-count">0 selected</span>
+            <button type="button" id="generate-refresh-source">Refresh list</button>
+          </div>
+
+          <fieldset class="generate-mode">
+            <legend>Generation mode</legend>
+            <label>
+              <input type="radio" name="generate-mode" value="edge-cases" checked />
+              Draft edge cases (validation errors, auth failures, boundary values) shaped like the selected traffic
+            </label>
+            <label>
+              <input type="radio" name="generate-mode" value="from-recordings" />
+              Recreate the selected traffic as static mocks
+            </label>
+          </fieldset>
+
+          <button type="button" id="generate-run-button" disabled>Generate mocks with AI</button>
+          <p id="generate-error" class="error" hidden></p>
+
+          <div id="generate-results" hidden>
+            <h2>Review candidates</h2>
+            <p class="hint">Nothing below is loaded into MockServer yet. Edit or remove any candidate, then approve to load the rest.</p>
+            <div id="generate-candidates"></div>
+
+            <div id="generate-rejected-section" hidden>
+              <h3>Rejected by validation</h3>
+              <p class="hint">These weren't usable as-is and can't be loaded.</p>
+              <ul id="generate-rejected-list"></ul>
+            </div>
+
+            <button type="button" id="generate-approve-button">Approve &amp; load remaining candidates</button>
+            <p id="generate-load-result" class="requests-empty-note" hidden></p>
+          </div>
         </div>
       </section>
 

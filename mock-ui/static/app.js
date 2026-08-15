@@ -95,13 +95,16 @@ function onServerChanged() {
   if (getCurrentPageFromHash() === "requests") {
     reloadRequestsForFilterChange();
   }
+  if (getCurrentPageFromHash() === "generate") {
+    syncGeneratePage("generate");
+  }
 }
 
 serverSelect.addEventListener("change", onServerChanged);
 
 // --- navigation ---
 
-const VALID_PAGES = ["create", "list", "requests", "help"];
+const VALID_PAGES = ["create", "list", "requests", "generate", "help"];
 let successBannerTimeout = null;
 
 function getCurrentPageFromHash() {
@@ -141,6 +144,7 @@ window.addEventListener("hashchange", () => {
   const page = getCurrentPageFromHash();
   showPage(page);
   syncRequestsPageStream(page);
+  syncGeneratePage(page);
 });
 
 function showError(message) {
@@ -412,6 +416,11 @@ async function resyncRequestsHistory(reasonText) {
 const REQUESTS_RECONNECT_BASE_DELAY_MS = 1000;
 const REQUESTS_RECONNECT_MAX_DELAY_MS = 30000;
 const REQUESTS_DISCONNECTED_THRESHOLD = 5;
+// Bounds the live tail's own DOM growth - independent of REQUEST_HISTORY_LIMIT, which only
+// bounds one page's fetch cost from mock-ui's backend. Without this, a tab left open during
+// sustained traffic accumulates rows (2 DOM nodes each) without limit. See design.md in
+// openspec/changes/cap-recent-requests-live-tail-rows.
+const LIVE_TAIL_MAX_ROWS = 500;
 const REQUESTS_CONNECTION_STATE_LABELS = {
   connecting: "Connecting…",
   live: "Live",
@@ -622,6 +631,14 @@ function prependRequestRow(entry) {
   const summaryRow = renderRequestRow(entry, detailRow);
   requestsBody.insertBefore(detailRow, requestsBody.firstChild);
   requestsBody.insertBefore(summaryRow, detailRow);
+  // Rows arrive here in unbounded quantity over an unbounded amount of time (the live tail and
+  // the paused-tail backlog replay), unlike appendRequestRow's page-at-a-time loads - so this is
+  // the one insertion path that needs to evict, keeping the table's DOM size flat regardless of
+  // arrival rate or how long the tab has been open. See design.md in
+  // openspec/changes/cap-recent-requests-live-tail-rows.
+  while (requestsBody.children.length > LIVE_TAIL_MAX_ROWS * 2) {
+    requestsBody.removeChild(requestsBody.lastElementChild);
+  }
   updateRequestsEmptyState();
 }
 
@@ -777,15 +794,291 @@ requestsLoadMoreButton.addEventListener("click", () => {
   loadMoreRequests().catch((err) => showRequestsError(err.message));
 });
 
+// --- AI Mock Generator page: select captured requests, draft candidates with an LLM, review,
+// approve, and load - see openspec/changes/add-llm-mock-generation. Nothing here calls the
+// generation endpoints without an explicit developer click, and nothing loads into MockServer
+// without the separate "Approve & load" click.
+
+// Must match MOCK_GENERATION_MAX_SOURCE_ENTRIES in mock-ui/app.py - kept as a client-side guard
+// so a developer sees the cap before submitting, not only after a 400 comes back.
+const GENERATE_MAX_SOURCE_ENTRIES = 25;
+
+const navGenerateLink = document.getElementById("nav-generate");
+const generateUnavailableNotice = document.getElementById("generate-unavailable");
+const generateAvailableContent = document.getElementById("generate-available-content");
+const generateSourceBody = document.getElementById("generate-source-body");
+const generateSourceEmpty = document.getElementById("generate-source-empty");
+const generateSelectionCount = document.getElementById("generate-selection-count");
+const generateRefreshSourceButton = document.getElementById("generate-refresh-source");
+const generateRunButton = document.getElementById("generate-run-button");
+const generateError = document.getElementById("generate-error");
+const generateResults = document.getElementById("generate-results");
+const generateCandidatesContainer = document.getElementById("generate-candidates");
+const generateRejectedSection = document.getElementById("generate-rejected-section");
+const generateRejectedList = document.getElementById("generate-rejected-list");
+const generateApproveButton = document.getElementById("generate-approve-button");
+const generateLoadResult = document.getElementById("generate-load-result");
+
+let generationAvailable = false;
+let generationSourceEntries = [];
+let generationSelectedIndexes = new Set();
+let generationCandidates = [];
+
+function showGenerateError(message) {
+  generateError.textContent = message;
+  generateError.hidden = false;
+}
+
+function clearGenerateError() {
+  generateError.hidden = true;
+  generateError.textContent = "";
+}
+
+async function checkMockGenerationAvailability() {
+  try {
+    const response = await fetch("/mock-ui/api/mock-generation/status");
+    if (!response.ok) {
+      throw new Error(`status check failed: ${response.status}`);
+    }
+    const data = await response.json();
+    generationAvailable = Boolean(data.available);
+  } catch (err) {
+    generationAvailable = false;
+  }
+  navGenerateLink.hidden = !generationAvailable;
+  generateUnavailableNotice.hidden = generationAvailable;
+  generateAvailableContent.hidden = !generationAvailable;
+}
+
+function updateGenerateSelectionCount() {
+  generateSelectionCount.textContent = `${generationSelectedIndexes.size} selected (max ${GENERATE_MAX_SOURCE_ENTRIES})`;
+  generateRunButton.disabled = generationSelectedIndexes.size === 0;
+}
+
+function renderGenerateSourceList() {
+  generateSourceBody.innerHTML = "";
+  generateSourceEmpty.hidden = generationSourceEntries.length > 0;
+  generationSourceEntries.forEach((entry, index) => {
+    const row = document.createElement("tr");
+    const sourceLabel = entry.mocked ? "Mocked" : "Forwarded";
+    const sourceClass = entry.mocked ? "requests-source-mocked" : "requests-source-forwarded";
+    row.innerHTML = `
+      <td><input type="checkbox" class="generate-source-checkbox" /></td>
+      <td>${escapeHtml(entry.method)}</td>
+      <td><code>${escapeHtml(entry.path)}</code></td>
+      <td>${escapeHtml(entry.statusCode)}</td>
+      <td><span class="badge ${sourceClass}">${sourceLabel}</span></td>
+    `;
+    const checkbox = row.querySelector(".generate-source-checkbox");
+    checkbox.checked = generationSelectedIndexes.has(index);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) {
+        if (generationSelectedIndexes.size >= GENERATE_MAX_SOURCE_ENTRIES) {
+          checkbox.checked = false;
+          showGenerateError(`You can select at most ${GENERATE_MAX_SOURCE_ENTRIES} requests per generation run.`);
+          return;
+        }
+        clearGenerateError();
+        generationSelectedIndexes.add(index);
+      } else {
+        generationSelectedIndexes.delete(index);
+      }
+      updateGenerateSelectionCount();
+    });
+    generateSourceBody.appendChild(row);
+  });
+  updateGenerateSelectionCount();
+}
+
+async function loadGenerateSourceEntries() {
+  const response = await fetch(withServer("/mock-ui/api/requests"));
+  if (!response.ok) {
+    throw new Error(`failed to load recent requests: ${response.status}`);
+  }
+  const data = await response.json();
+  generationSourceEntries = data.entries;
+  generationSelectedIndexes = new Set();
+  renderGenerateSourceList();
+}
+
+function renderGenerateCandidateCard(candidate, index) {
+  const card = document.createElement("div");
+  card.className = "generate-candidate";
+  card.dataset.index = String(index);
+  const bodyText = candidate.responseBody === undefined ? "" : JSON.stringify(candidate.responseBody, null, 2);
+  const methodOptions = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+    .map((method) => `<option${candidate.method === method ? " selected" : ""}>${method}</option>`)
+    .join("");
+  card.innerHTML = `
+    <div class="generate-candidate-fields">
+      <label>Method
+        <select class="generate-candidate-method">${methodOptions}</select>
+      </label>
+      <label>Path
+        <input type="text" class="generate-candidate-path" value="${escapeHtml(candidate.path || "")}" />
+      </label>
+      <label>Status code
+        <input type="number" class="generate-candidate-status" value="${candidate.statusCode ?? 200}" min="100" max="599" />
+      </label>
+    </div>
+    <label>Response body (JSON)
+      <textarea class="generate-candidate-body" rows="4">${escapeHtml(bodyText)}</textarea>
+    </label>
+    <button type="button" class="generate-candidate-remove">Remove</button>
+  `;
+  card.querySelector(".generate-candidate-remove").addEventListener("click", () => {
+    card.remove();
+    generateApproveButton.disabled = generateCandidatesContainer.children.length === 0;
+  });
+  generateCandidatesContainer.appendChild(card);
+}
+
+function renderGenerateCandidates(candidates, rejected) {
+  generationCandidates = candidates;
+  generateCandidatesContainer.innerHTML = "";
+  candidates.forEach((candidate, index) => renderGenerateCandidateCard(candidate, index));
+
+  generateRejectedList.innerHTML = "";
+  for (const item of rejected) {
+    const li = document.createElement("li");
+    li.textContent = `${item.reason} - ${JSON.stringify(item.raw)}`;
+    generateRejectedList.appendChild(li);
+  }
+  generateRejectedSection.hidden = rejected.length === 0;
+
+  generateResults.hidden = false;
+  generateApproveButton.disabled = candidates.length === 0;
+  generateLoadResult.hidden = true;
+}
+
+generateRunButton.addEventListener("click", async () => {
+  clearGenerateError();
+  generateResults.hidden = true;
+
+  if (generationSelectedIndexes.size === 0) {
+    showGenerateError("Select at least one captured request before generating.");
+    return;
+  }
+
+  const mode = document.querySelector('input[name="generate-mode"]:checked').value;
+  const sourceEntries = Array.from(generationSelectedIndexes)
+    .sort((a, b) => a - b)
+    .map((index) => generationSourceEntries[index]);
+
+  generateRunButton.disabled = true;
+  generateRunButton.textContent = "Generating…";
+  try {
+    const response = await fetch(withServer("/mock-ui/api/mock-generation/draft"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceEntries, mode }),
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(detail.error || `generation failed: ${response.status}`);
+    }
+    const data = await response.json();
+    renderGenerateCandidates(data.candidates, data.rejected);
+  } catch (err) {
+    showGenerateError(err.message);
+  } finally {
+    generateRunButton.disabled = generationSelectedIndexes.size === 0;
+    generateRunButton.textContent = "Generate mocks with AI";
+  }
+});
+
+generateApproveButton.addEventListener("click", async () => {
+  clearGenerateError();
+
+  const cards = generateCandidatesContainer.querySelectorAll(".generate-candidate");
+  const mocksToLoad = [];
+  for (const card of cards) {
+    const index = Number(card.dataset.index);
+    const original = generationCandidates[index] || {};
+    const bodyText = card.querySelector(".generate-candidate-body").value.trim();
+    let responseBody;
+    try {
+      responseBody = bodyText === "" ? {} : JSON.parse(bodyText);
+    } catch (err) {
+      showGenerateError(`Candidate ${index + 1}: response body must be valid JSON.`);
+      return;
+    }
+    mocksToLoad.push({
+      ...original,
+      method: card.querySelector(".generate-candidate-method").value,
+      path: card.querySelector(".generate-candidate-path").value,
+      statusCode: Number(card.querySelector(".generate-candidate-status").value),
+      responseBody,
+    });
+  }
+
+  if (mocksToLoad.length === 0) {
+    showGenerateError("No candidates left to load.");
+    return;
+  }
+
+  generateApproveButton.disabled = true;
+  try {
+    const response = await fetch(withServer("/mock-ui/api/mock-generation/load"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mocks: mocksToLoad }),
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      throw new Error(detail.error || `load failed: ${response.status}`);
+    }
+    const data = await response.json();
+
+    generateCandidatesContainer.innerHTML = "";
+    generateLoadResult.textContent =
+      `Loaded ${data.loaded.length} mock${data.loaded.length === 1 ? "" : "s"} into MockServer.` +
+      (data.rejected.length > 0 ? ` ${data.rejected.length} could not be loaded.` : "");
+    generateLoadResult.hidden = false;
+    for (const item of data.rejected) {
+      const li = document.createElement("li");
+      li.textContent = `${item.reason} - ${JSON.stringify(item.raw)}`;
+      generateRejectedList.appendChild(li);
+    }
+    generateRejectedSection.hidden = generateRejectedList.children.length === 0;
+
+    await loadMocks();
+    showSuccessBanner(`Loaded ${data.loaded.length} AI-generated mock${data.loaded.length === 1 ? "" : "s"}.`);
+  } catch (err) {
+    showGenerateError(err.message);
+  } finally {
+    generateApproveButton.disabled = false;
+  }
+});
+
+generateRefreshSourceButton.addEventListener("click", () => {
+  loadGenerateSourceEntries().catch((err) => showGenerateError(err.message));
+});
+
+async function syncGeneratePage(page) {
+  if (page !== "generate" || !generationAvailable) {
+    return;
+  }
+  clearGenerateError();
+  generateResults.hidden = true;
+  try {
+    await loadGenerateSourceEntries();
+  } catch (err) {
+    showGenerateError(err.message);
+  }
+}
+
 async function init() {
   try {
     await loadServers();
   } catch (err) {
     showError(err.message);
   }
+  await checkMockGenerationAvailability();
   const initialPage = getCurrentPageFromHash();
   showPage(initialPage);
   syncRequestsPageStream(initialPage);
+  syncGeneratePage(initialPage);
   loadMocks().catch((err) => showError(err.message));
 }
 

@@ -169,11 +169,16 @@ in `k8s/overlays/with-mockserver/mock-ui-deployment.yaml`; that file doubles as 
 | `REQUEST_HISTORY_LIMIT` | `40` | Recent Requests page size - how many requests one page/load-more fetch returns. |
 | `REQUEST_STREAM_POLL_SECONDS` | `1` | How often (in seconds) the background poller re-checks each target's MockServer for new requests. |
 | `HEARTBEAT_INTERVAL_SECONDS` | `15` | How often (in seconds) an idle live-tail connection sends a keep-alive event, to stay under typical proxy/ALB idle-connection timeouts. |
+| `BEDROCK_MODEL_ID` | *(unset)* | Enables the AI Mock Generator page - the AWS Bedrock model or inference-profile ID it calls. Unset means that page is simply unavailable - see below. |
+| `AWS_REGION` | *(boto3's own resolution)* | AWS region for the Bedrock call. Only read when `BEDROCK_MODEL_ID` is set; if unset, falls back to whatever boto3's standard chain resolves (`AWS_DEFAULT_REGION`, shared config file, instance metadata). |
 
 `REQUEST_HISTORY_LIMIT`, `REQUEST_STREAM_POLL_SECONDS`, and `HEARTBEAT_INTERVAL_SECONDS` each accept a
 positive integer; an unset variable keeps its default, and an invalid value (non-integer, zero, or
 negative) fails `mock-ui` startup immediately with a specific error, rather than starting with an unusable
 setting.
+
+Unlike those, `BEDROCK_MODEL_ID` fails *open*, not fast: `mock-ui` starts up and runs normally without it,
+just with the AI Mock Generator page unavailable - see "Configuring AI mock generation" below.
 
 #### Configuring which MockServer instances mock-ui can reach
 
@@ -195,6 +200,39 @@ rebuild. If `MOCKSERVER_TARGETS` is unset, `mock-ui` falls back to a single targ
 working unchanged. Because this POC's manifest always sets `MOCKSERVER_TARGETS`, `MOCKSERVER_URL` has no
 effect there today - it only matters for a deployment that intentionally omits `MOCKSERVER_TARGETS` in
 favor of a single fixed MockServer.
+
+#### Configuring AI mock generation
+
+The **AI Mock Generator** page lets a developer select captured Recent Requests entries and have an LLM
+draft candidate mock expectations from them, reviewed and approved before anything loads into MockServer
+(see `openspec/changes/add-llm-mock-generation`). It calls the model through **AWS Bedrock** rather than a
+single model vendor's API directly, so which model actually answers - Anthropic Claude, Amazon Nova, Meta
+Llama, or anything else Bedrock hosts that supports the Converse API - is a configuration choice
+(`BEDROCK_MODEL_ID`), not a code change.
+
+Two things are needed:
+
+1. **Model access.** In the AWS Bedrock console, request access to whichever model `BEDROCK_MODEL_ID` names
+   (Bedrock model access is opt-in per AWS account and region). Some models (notably newer Claude models,
+   in certain regions) require an inference-profile ID rather than a bare model ID - `BEDROCK_MODEL_ID`
+   accepts either form as an opaque value.
+2. **AWS credentials with `bedrock:InvokeModel` permission for that model.** Prefer letting the `mock-ui`
+   pod assume an IAM role (IRSA on EKS, or an instance profile on plain EC2 nodes) - boto3 picks that up
+   automatically with no extra configuration. For a cluster without such a role (e.g. this POC's local
+   cluster), fall back to a static key pair, which is deliberately **not** committed anywhere in this repo -
+   `mock-ui-deployment.yaml` reads it from a `mock-ui-aws-credentials` Secret that you create yourself:
+
+   ```sh
+   kubectl create secret generic mock-ui-aws-credentials \
+     --namespace mockserver-poc \
+     --from-literal=access-key-id=<your AWS access key ID> \
+     --from-literal=secret-access-key=<your AWS secret access key>
+   ```
+
+Until `BEDROCK_MODEL_ID` is set (and, in the static-key case, until that Secret exists), the AI Mock
+Generator page is simply unavailable - `mock-ui` starts and runs normally either way (see
+`BEDROCK_MODEL_ID`'s fail-open behavior above). Restart the `mock-ui` pod after creating or updating the
+Secret so it picks up the new environment variables.
 
 ## Mock persistence
 

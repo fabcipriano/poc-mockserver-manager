@@ -130,6 +130,7 @@ body {
 
 .content {
   flex: 1;
+  min-width: 0;
   padding: 2rem 2.5rem;
   max-width: 52rem;
 }
@@ -333,7 +334,7 @@ button[type="button"]:not(.add-row):not(.remove-row):not(#success-banner-dismiss
   background: var(--color-surface-alt);
   border: 1px solid var(--color-border);
   border-radius: var(--radius);
-  overflow: hidden;
+  overflow: auto;
   margin-top: 1rem;
 }
 
@@ -359,6 +360,42 @@ th {
 
 tbody tr:last-child td {
   border-bottom: none;
+}
+
+#requests-table {
+  table-layout: fixed;
+  min-width: 45rem;
+}
+
+#requests-table th:nth-child(1),
+#requests-table .requests-row td:nth-child(1) {
+  width: 12rem;
+}
+
+#requests-table th:nth-child(2),
+#requests-table .requests-row td:nth-child(2) {
+  width: 5.5rem;
+}
+
+#requests-table th:nth-child(4),
+#requests-table .requests-row td:nth-child(4) {
+  width: 4.5rem;
+}
+
+#requests-table th:nth-child(5),
+#requests-table .requests-row td:nth-child(5) {
+  width: 7rem;
+}
+
+#requests-table th:nth-child(6),
+#requests-table .requests-row td:nth-child(6) {
+  width: 6rem;
+}
+
+#requests-table .requests-row td:nth-child(3) code {
+  display: block;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .body-preview {
@@ -602,4 +639,51 @@ tbody tr:last-child td {
   border-radius: 3px;
   font-family: ui-monospace, monospace;
   font-size: 0.9em;
+}
+
+/* --- AI Mock Generator page --- */
+
+.generate-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin: 0.75rem 0 1.25rem;
+}
+
+.generate-mode {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.generate-mode label {
+  display: block;
+  font-weight: normal;
+  margin: 0.4rem 0;
+}
+
+.generate-candidate {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface-alt);
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.generate-candidate-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.generate-candidate-fields label {
+  flex: 1 1 10rem;
+}
+
+.generate-candidate-remove {
+  margin-top: 0.5rem;
 }
