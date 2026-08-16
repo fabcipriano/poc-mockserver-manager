@@ -377,7 +377,10 @@ let requestsEventSource = null;
 let requestsPaused = false;
 let requestsPendingQueue = [];
 let requestsFilterDebounce = null;
-let requestsOldestLoadedTimestamp = null;
+// Opaque pagination cursor from the last-loaded entry's "cursor" field (backed by the
+// backend's SQLite rowid, not its displayed timestamp - see design.md's pagination-cursor
+// decision). Never interpreted client-side, only echoed back as the "before" query param.
+let requestsOldestLoadedCursor = null;
 let requestsHasMore = false;
 let requestsReconnectTimer = null;
 let requestsReconnectAttempt = 0;
@@ -652,7 +655,7 @@ async function loadRequestHistory() {
   for (const entry of data.entries) {
     appendRequestRow(entry);
   }
-  requestsOldestLoadedTimestamp = data.entries.length > 0 ? data.entries[data.entries.length - 1].timestamp : null;
+  requestsOldestLoadedCursor = data.entries.length > 0 ? data.entries[data.entries.length - 1].cursor : null;
   requestsHasMore = data.hasMore;
   updateRequestsEmptyState();
   updateRequestsPaginationUI();
@@ -660,10 +663,10 @@ async function loadRequestHistory() {
 }
 
 async function loadMoreRequests() {
-  if (!requestsOldestLoadedTimestamp) {
+  if (!requestsOldestLoadedCursor) {
     return;
   }
-  const response = await fetch(requestsApiUrl("/mock-ui/api/requests", { before: requestsOldestLoadedTimestamp }));
+  const response = await fetch(requestsApiUrl("/mock-ui/api/requests", { before: requestsOldestLoadedCursor }));
   if (!response.ok) {
     throw new Error(`failed to load older requests: ${response.status}`);
   }
@@ -672,7 +675,7 @@ async function loadMoreRequests() {
     appendRequestRow(entry);
   }
   if (data.entries.length > 0) {
-    requestsOldestLoadedTimestamp = data.entries[data.entries.length - 1].timestamp;
+    requestsOldestLoadedCursor = data.entries[data.entries.length - 1].cursor;
   }
   requestsHasMore = data.hasMore;
   updateRequestsPaginationUI();

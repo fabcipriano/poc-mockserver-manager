@@ -209,7 +209,7 @@ The mock-ui server SHALL determine its recent-requests page size, live-tail poll
 - **THEN** the process exits at startup with a specific error identifying which variable and value was invalid, rather than starting with an unusable or silently-clamped setting
 
 ### Requirement: Web UI shows recent requests received by MockServer
-The web interface's Recent Requests page SHALL display MockServer's actual received-request history - timestamp, method, path, response status code, and whether MockServer answered the request from a developer-created mock or forwarded it to the Gateway/backend - sourced live from MockServer rather than a copy the web interface keeps itself, showing the most recent requests first. Each displayed timestamp SHALL be shown in the viewer's local time zone rather than the raw UTC value MockServer logs. For any entry, the developer SHALL be able to reveal that request's and its response's headers and body, also sourced live from MockServer rather than a copy the web interface keeps itself.
+The web interface's Recent Requests page SHALL display request history - timestamp, method, path, response status code, and whether MockServer answered the request from a developer-created mock or forwarded it to the Gateway/backend - for every request `mock-ui` has observed from the selected MockServer target since `mock-ui` last started, accumulated by `mock-ui` in its own local store independent of MockServer's own log retention, showing the most recent requests first. Each displayed timestamp SHALL be shown in the viewer's local time zone rather than the raw UTC value MockServer logs. For any entry, the developer SHALL be able to reveal that request's and its response's headers and body, sourced from `mock-ui`'s locally stored record of what MockServer returned when the request was first observed. The control that reveals detail for an entry SHALL remain visible regardless of how long that entry's path is.
 
 #### Scenario: Developer views recent traffic
 - **WHEN** a developer navigates to the Recent Requests page
@@ -225,7 +225,7 @@ The web interface's Recent Requests page SHALL display MockServer's actual recei
 
 #### Scenario: Developer reveals a request's full detail
 - **WHEN** a developer asks to see more detail for one of the listed requests
-- **THEN** that request's headers and body, and its response's headers and body, are shown, reflecting what MockServer actually recorded rather than a summary
+- **THEN** that request's headers and body, and its response's headers and body, are shown, reflecting what MockServer actually recorded when `mock-ui` first observed the request, rather than a summary
 
 #### Scenario: A request or response with no headers or no body is shown as such
 - **WHEN** a developer reveals detail for a request whose response has no body, or whose request or response has no headers
@@ -234,6 +234,14 @@ The web interface's Recent Requests page SHALL display MockServer's actual recei
 #### Scenario: Multiple entries can be expanded at once
 - **WHEN** a developer reveals detail for more than one listed request
 - **THEN** each revealed request's detail remains visible independently of the others
+
+#### Scenario: A request remains visible after MockServer evicts it from its own log
+- **WHEN** MockServer's own request log has evicted a request (for example, due to its `maxLogEntries` cap) that `mock-ui` had already observed during an earlier poll
+- **THEN** that request continues to appear on the Recent Requests page, sourced from `mock-ui`'s own locally accumulated history rather than from MockServer's current log
+
+#### Scenario: A long request path does not hide the detail control
+- **WHEN** a request's path is long enough that its full text would otherwise force the row wider than the page
+- **THEN** the path text wraps within its own column instead of pushing other columns out of view, and that row's detail-revealing control remains visible and clickable without horizontal scrolling
 
 ### Requirement: Live-tailed requests support the same detail view as history
 The web interface's Recent Requests page SHALL let a developer reveal headers and body detail for a request added to the page by the live tail, the same as for a request loaded from history.
@@ -274,7 +282,7 @@ The web interface SHALL let a developer narrow the Recent Requests page to only 
 - **THEN** the value is treated as the viewer's local time and converted to match MockServer's UTC-logged timestamps before filtering, so it lines up with the locally-displayed timestamps on the page
 
 #### Scenario: A time range predating MockServer's retained history is communicated, not silently incomplete
-- **WHEN** a developer sets a "from" time earlier than the oldest request MockServer currently retains
+- **WHEN** a developer sets a "from" time earlier than the oldest request `mock-ui` currently retains in its locally accumulated history (which may predate what MockServer itself still retains, or vice versa if `mock-ui`'s own retention policy has pruned further back than MockServer's ring buffer, and which in either case only covers what `mock-ui` has observed since it last started)
 - **THEN** the page shows requests from the oldest retained entry onward and indicates that earlier requests are no longer available, rather than implying the range was fully searched
 
 #### Scenario: The time range filter does not scope the live tail
@@ -327,8 +335,27 @@ The web interface's Recent Requests page SHALL let a developer load additional, 
 - **THEN** the additional requests loaded also satisfy all of those active filters
 
 #### Scenario: Reaching the oldest available request
-- **WHEN** a developer loads older requests until reaching the oldest request MockServer currently retains
+- **WHEN** a developer loads older requests until reaching the oldest request `mock-ui` currently retains in its locally accumulated history
 - **THEN** the page indicates that no older requests are available, rather than allowing another load attempt that returns nothing with no explanation
+
+### Requirement: Recent Requests history stays reliable independent of MockServer's own log retention
+While `mock-ui` is running, the web interface SHALL retain every request it has observed for each configured MockServer target in its own local store, such that the Recent Requests page continues to show a previously observed request after MockServer itself has evicted that request from its own log. Locally accumulated history SHALL be bounded by an explicit retention policy rather than retained without limit. This history is not required to survive a `mock-ui` process restart or pod reschedule - it covers only what `mock-ui` has observed since it last started.
+
+#### Scenario: A previously observed request is not silently lost while mock-ui keeps running
+- **WHEN** `mock-ui` has observed and locally stored a request, and MockServer subsequently evicts that request from its own log during normal, continued operation
+- **THEN** the request still appears on the Recent Requests page, without requiring `mock-ui` to have been restarted
+
+#### Scenario: Locally accumulated history is bounded, not unbounded
+- **WHEN** the volume of requests `mock-ui` has observed for a target exceeds its configured retention policy
+- **THEN** `mock-ui` prunes the oldest locally stored entries for that target so its stored history stays within the configured bound, rather than growing without limit
+
+#### Scenario: Each configured target's locally accumulated history is independent
+- **WHEN** `mock-ui` is configured with multiple MockServer targets
+- **THEN** each target's locally stored request history and retention are tracked independently, and pruning or restarting the history for one target does not affect another target's history
+
+#### Scenario: A mock-ui restart starts each target's history empty
+- **WHEN** `mock-ui` is restarted
+- **THEN** each configured target's Recent Requests history begins empty again and reaccumulates from subsequent polls, rather than being expected to reflect requests observed before the restart
 
 ### Requirement: Web UI remains responsive with multiple simultaneous viewers
 The web interface SHALL keep the Recent Requests page responsive - including pages and endpoints unrelated to Recent Requests - when multiple developers have the page open at the same time, whether viewing the same target or different targets, regardless of how many requests any configured MockServer target has logged.
@@ -386,7 +413,7 @@ The mock-ui server SHALL emit structured log records - at minimum a timestamp, a
 - **THEN** the mock-ui server's logs contain a record of that successful poll, so a gap in successful-poll log entries itself indicates when the poller stopped working
 
 ### Requirement: Web UI automatically reconnects a lost live tail connection
-The web interface's Recent Requests page SHALL automatically attempt to reestablish the live tail connection after it is lost, using increasing delays between attempts up to a capped maximum, rather than requiring the developer to manually reload the page.
+The web interface's Recent Requests page SHALL automatically attempt to reestablish the live tail connection after it is lost, using increasing delays between attempts up to a capped maximum, rather than requiring the developer to manually reload the page. Upon successfully reestablishing a previously lost connection, the web interface SHALL resync its displayed request history with MockServer's current state rather than only resuming delivery of newly arriving requests.
 
 #### Scenario: Live tail reconnects after a transient drop
 - **WHEN** the live tail connection is lost while a developer has the Recent Requests page open
@@ -395,6 +422,28 @@ The web interface's Recent Requests page SHALL automatically attempt to reestabl
 #### Scenario: Reconnection attempts back off rather than retrying in a tight loop
 - **WHEN** the live tail connection repeatedly fails to reestablish
 - **THEN** the delay between successive reconnection attempts increases up to a capped maximum, rather than retrying immediately and continuously
+
+#### Scenario: A successful reconnect resyncs history, not just the tail
+- **WHEN** the live tail connection is lost and then successfully reestablished
+- **THEN** the displayed request history is refreshed to match MockServer's current state, so requests shown before the drop that are no longer part of MockServer's history (for example, because MockServer itself restarted while mock-ui's connection to it was interrupted) are no longer shown as current
+
+### Requirement: Web UI detects and resyncs a MockServer-side history reset without requiring a connection drop
+The mock-ui server SHALL detect when MockServer's request/response history has been reset (for example, because MockServer itself restarted) even while its own connection to MockServer and to open Recent Requests browser tabs remains uninterrupted, and SHALL cause every open Recent Requests page to resync its displayed history to MockServer's current state shortly after detecting the reset, with a visible indication to the developer that a resync occurred.
+
+#### Scenario: A MockServer-only restart is detected and resynced without a live-tail reconnect
+- **WHEN** MockServer restarts and its request/response history is reset while a developer has the Recent Requests page open and its live tail connection to mock-ui never drops
+- **THEN** the displayed request history is refreshed to match MockServer's current (reset) state within a short, bounded time of the reset being detected, without requiring the developer to reload the page or the live tail connection to have dropped and reconnected
+
+#### Scenario: Developer is told a resync happened
+- **WHEN** the Recent Requests page's displayed history is refreshed because a MockServer-side reset was detected
+- **THEN** the developer sees a visible, transient notice explaining that the history was refreshed because of a detected reset, rather than the displayed rows silently changing with no explanation
+
+### Requirement: Web UI's shared history poller recovers from a MockServer connectivity interruption without requiring a mock-ui restart
+The mock-ui server's shared history poller SHALL continue polling MockServer on its normal cadence after any individual poll attempt fails for any reason, including a connection interrupted mid-request (for example, by MockServer restarting while a poll is in flight), without requiring mock-ui itself to be restarted for polling to resume.
+
+#### Scenario: A connection reset mid-poll does not permanently stop polling
+- **WHEN** a poll attempt's connection to MockServer is reset or otherwise interrupted partway through the request
+- **THEN** that attempt is treated as a failed poll, and the next scheduled poll attempt still occurs on the normal cadence, rather than polling stopping permanently for the rest of the mock-ui process's life
 
 ### Requirement: Web UI indicates the live tail's connection status
 The web interface's Recent Requests page SHALL display an always-visible indicator of the live tail's current connection status - at least Live, Reconnecting, and Disconnected - that updates as the connection's state changes, so a developer can tell at a glance whether newly arriving requests are currently being delivered.

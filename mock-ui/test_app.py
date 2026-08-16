@@ -1,15 +1,38 @@
 import json
 import os
+import shutil
+import tempfile
 import unittest
+import uuid
 from unittest.mock import MagicMock, patch
 
 import app as app_module
 from app import MockServerError, Target, _is_forwarded_response
 
+_TEST_HISTORY_DATA_DIR = None
+
+
+def setUpModule():
+    # Each target's SQLite history file lives under here for the whole test run, isolated from
+    # both a real deployment's REQUEST_HISTORY_DATA_DIR and any other test run - see design.md's
+    # "no PVC, local/ephemeral storage" decision.
+    global _TEST_HISTORY_DATA_DIR
+    _TEST_HISTORY_DATA_DIR = tempfile.mkdtemp(prefix="mock-ui-test-history-")
+    app_module.REQUEST_HISTORY_DATA_DIR = _TEST_HISTORY_DATA_DIR
+
+
+def tearDownModule():
+    shutil.rmtree(_TEST_HISTORY_DATA_DIR, ignore_errors=True)
+
 
 def _clear_target_env():
     os.environ.pop("MOCKSERVER_TARGETS", None)
     os.environ.pop("MOCKSERVER_URL", None)
+
+
+def _fresh_target(label="test"):
+    """A Target with a unique id, so its SQLite file never collides with another test's."""
+    return Target(f"{label}-{uuid.uuid4().hex[:8]}", "Test", "http://mockserver-test")
 
 
 class IsForwardedResponseTests(unittest.TestCase):
@@ -88,9 +111,9 @@ def _raw_entry(timestamp):
 
 
 class HistoryResetDetectionTests(unittest.TestCase):
-    def _run_poll(self, previous_snapshot, raw_response):
-        target = Target("test", "Test", "http://mockserver-test")
-        target.history_snapshot = list(previous_snapshot)
+    def _run_poll(self, previous_entries, raw_response):
+        target = _fresh_target()
+        target.last_polled_entries = list(previous_entries)
         with patch.object(app_module, "_mockserver_put", return_value=raw_response):
             app_module._poll_history_once(target)
             return target.history_reset_generation
@@ -183,7 +206,7 @@ class StreamHistoryResetEventTests(unittest.TestCase):
         target = app_module.DEFAULT_TARGET
         with patch.object(app_module, "REQUEST_STREAM_POLL_SECONDS", 0), patch.object(
             app_module, "HEARTBEAT_INTERVAL_SECONDS", 0
-        ), patch.object(target, "history_reset_generation", 0), patch.object(target, "history_snapshot", []):
+        ), patch.object(target, "history_reset_generation", 0):
             client = app_module.app.test_client()
             response = client.get("/mock-ui/api/requests/stream")
             # First tick: no reset yet, nothing new - falls through to the heartbeat, which
@@ -195,6 +218,130 @@ class StreamHistoryResetEventTests(unittest.TestCase):
         if isinstance(second_chunk, bytes):
             second_chunk = second_chunk.decode("utf-8")
         self.assertEqual(second_chunk, "event: history-reset\ndata: {}\n\n")
+
+
+def _seed(target, raw_entries):
+    with patch.object(app_module, "_mockserver_put", return_value=raw_entries):
+        app_module._poll_history_once(target)
+
+
+def _rows(target):
+    conn = app_module._open_history_db(target)
+    try:
+        return conn.execute("SELECT timestamp FROM requests ORDER BY id ASC").fetchall()
+    finally:
+        conn.close()
+
+
+class HistoryPersistenceTests(unittest.TestCase):
+    """Covers the SQLite-backed accumulation the history poller now does: upsert-not-replace,
+    dedup on repeated ticks, retention pruning, and per-target isolation - see design.md."""
+
+    def test_dedup_on_repeated_poll_ticks(self):
+        # The same MockServer log entry showing up again on a later tick (because MockServer
+        # hasn't evicted it yet) must not create a second row.
+        target = _fresh_target()
+        raw = [_raw_entry("2026-08-15 10:00:00.000000")]
+        _seed(target, raw)
+        _seed(target, raw)
+        self.assertEqual(len(_rows(target)), 1)
+
+    def test_entry_survives_mockserver_evicting_it_from_a_later_poll(self):
+        # Reproduces the bug this change fixes: once mock-ui has seen an entry, a later tick
+        # where MockServer's own retrieve response no longer includes it (simulating
+        # maxLogEntries eviction) must not remove it from mock-ui's own store.
+        target = _fresh_target()
+        early = _raw_entry("2026-08-15 10:00:00.000000")
+        _seed(target, [early])
+        later_only = [_raw_entry("2026-08-15 10:05:00.000000")]
+        _seed(target, later_only)
+        timestamps = [row[0] for row in _rows(target)]
+        self.assertIn("2026-08-15 10:00:00.000000", timestamps)
+        self.assertIn("2026-08-15 10:05:00.000000", timestamps)
+
+    def test_retention_prunes_oldest_rows_past_the_cap(self):
+        target = _fresh_target()
+        raw = [_raw_entry(f"2026-08-15 10:00:0{i}.000000") for i in range(3)]
+        with patch.object(app_module, "REQUEST_HISTORY_RETENTION_ROWS", 2):
+            _seed(target, raw)
+        timestamps = [row[0] for row in _rows(target)]
+        self.assertEqual(timestamps, ["2026-08-15 10:00:01.000000", "2026-08-15 10:00:02.000000"])
+
+    def test_per_target_history_is_isolated(self):
+        target_a = _fresh_target("a")
+        target_b = _fresh_target("b")
+        _seed(target_a, [_raw_entry("2026-08-15 10:00:00.000000")])
+        _seed(target_b, [_raw_entry("2026-08-15 11:00:00.000000")])
+        self.assertEqual([row[0] for row in _rows(target_a)], ["2026-08-15 10:00:00.000000"])
+        self.assertEqual([row[0] for row in _rows(target_b)], ["2026-08-15 11:00:00.000000"])
+
+    def test_default_retention_cap_covers_the_reproduced_load_test_scenario(self):
+        # scripts/load-test-recent-requests.sh sends TOTAL_REQUESTS (default 100,000) distinct
+        # requests. The retention cap must stay at or above that, or mock-ui's own pruning would
+        # silently re-introduce the same class of loss this change was built to fix (confirmed by
+        # directly running the upsert/prune path at that scale - see design.md's retention
+        # decision and tasks.md's note on the discrepancy this caught during implementation).
+        self.assertGreaterEqual(app_module.REQUEST_HISTORY_RETENTION_ROWS, 100000)
+
+
+class HistoryReadPathTests(unittest.TestCase):
+    """Covers list_requests/stream_requests reading from SQLite: rowid-based pagination cursor
+    and the path filter's LIKE-escaping - see design.md's pagination-cursor decision."""
+
+    def test_pagination_cursor_pages_through_history_newest_first(self):
+        target = _fresh_target()
+        raw = [_raw_entry(f"2026-08-15 10:00:0{i}.000000") for i in range(5)]
+        _seed(target, raw)
+        client = app_module.app.test_client()
+        with patch.object(app_module, "REQUEST_HISTORY_LIMIT", 2), patch.dict(
+            app_module.TARGETS_BY_ID, {target.id: target}
+        ):
+            first = client.get(f"/mock-ui/api/requests?server={target.id}").get_json()
+            self.assertEqual(
+                [e["timestamp"] for e in first["entries"]],
+                ["2026-08-15 10:00:04.000000", "2026-08-15 10:00:03.000000"],
+            )
+            self.assertTrue(first["hasMore"])
+
+            second = client.get(
+                f"/mock-ui/api/requests?server={target.id}&before={first['entries'][-1]['cursor']}"
+            ).get_json()
+            self.assertEqual(
+                [e["timestamp"] for e in second["entries"]],
+                ["2026-08-15 10:00:02.000000", "2026-08-15 10:00:01.000000"],
+            )
+            self.assertTrue(second["hasMore"])
+
+            third = client.get(
+                f"/mock-ui/api/requests?server={target.id}&before={second['entries'][-1]['cursor']}"
+            ).get_json()
+            self.assertEqual([e["timestamp"] for e in third["entries"]], ["2026-08-15 10:00:00.000000"])
+            self.assertFalse(third["hasMore"])
+
+    def test_path_filter_treats_percent_and_underscore_as_literal_characters(self):
+        # LIKE treats % and _ as wildcards unless escaped - without _like_escape, a path
+        # containing them would match unrelated paths instead of just its own literal text.
+        target = _fresh_target()
+        raw = [
+            {
+                "timestamp": "2026-08-15 10:00:00.000000",
+                "httpRequest": {"method": "GET", "path": "/100%_off"},
+                "httpResponse": {"statusCode": 200},
+            },
+            {
+                "timestamp": "2026-08-15 10:00:01.000000",
+                "httpRequest": {"method": "GET", "path": "/100Xoff"},
+                "httpResponse": {"statusCode": 200},
+            },
+        ]
+        _seed(target, raw)
+        client = app_module.app.test_client()
+        with patch.dict(app_module.TARGETS_BY_ID, {target.id: target}):
+            response = client.get(
+                "/mock-ui/api/requests", query_string={"server": target.id, "path": "100%_off"}
+            )
+        entries = response.get_json()["entries"]
+        self.assertEqual([e["path"] for e in entries], ["/100%_off"])
 
 
 class TargetParsingTests(unittest.TestCase):

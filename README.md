@@ -159,7 +159,7 @@ against the same live state.
 
 `mock-ui` is configured entirely through environment variables read once at process startup, so migrating
 it to a different environment - a different cluster, a different set of MockServer instances, different
-traffic volume - is a configuration change, not a code change or image rebuild. All five variables are set
+traffic volume - is a configuration change, not a code change or image rebuild. All of these are set
 in `k8s/overlays/with-mockserver/mock-ui-deployment.yaml`; that file doubles as a working example.
 
 | Variable | Default | Controls |
@@ -169,10 +169,13 @@ in `k8s/overlays/with-mockserver/mock-ui-deployment.yaml`; that file doubles as 
 | `REQUEST_HISTORY_LIMIT` | `40` | Recent Requests page size - how many requests one page/load-more fetch returns. |
 | `REQUEST_STREAM_POLL_SECONDS` | `1` | How often (in seconds) the background poller re-checks each target's MockServer for new requests. |
 | `HEARTBEAT_INTERVAL_SECONDS` | `15` | How often (in seconds) an idle live-tail connection sends a keep-alive event, to stay under typical proxy/ALB idle-connection timeouts. |
+| `REQUEST_HISTORY_RETENTION_ROWS` | `120000` | How many requests per MockServer target `mock-ui` keeps in its own local Recent Requests history before pruning the oldest. See "Recent Requests history storage" below. |
+| `REQUEST_HISTORY_DATA_DIR` | `/tmp/mock-ui-request-history` | Local/ephemeral directory `mock-ui` writes each target's Recent Requests SQLite file to. See "Recent Requests history storage" below. |
 | `BEDROCK_MODEL_ID` | *(unset)* | Enables the AI Mock Generator page - the AWS Bedrock model or inference-profile ID it calls. Unset means that page is simply unavailable - see below. |
 | `AWS_REGION` | *(boto3's own resolution)* | AWS region for the Bedrock call. Only read when `BEDROCK_MODEL_ID` is set; if unset, falls back to whatever boto3's standard chain resolves (`AWS_DEFAULT_REGION`, shared config file, instance metadata). |
 
-`REQUEST_HISTORY_LIMIT`, `REQUEST_STREAM_POLL_SECONDS`, and `HEARTBEAT_INTERVAL_SECONDS` each accept a
+`REQUEST_HISTORY_LIMIT`, `REQUEST_STREAM_POLL_SECONDS`, `HEARTBEAT_INTERVAL_SECONDS`, and
+`REQUEST_HISTORY_RETENTION_ROWS` each accept a
 positive integer; an unset variable keeps its default, and an invalid value (non-integer, zero, or
 negative) fails `mock-ui` startup immediately with a specific error, rather than starting with an unusable
 setting.
@@ -200,6 +203,22 @@ rebuild. If `MOCKSERVER_TARGETS` is unset, `mock-ui` falls back to a single targ
 working unchanged. Because this POC's manifest always sets `MOCKSERVER_TARGETS`, `MOCKSERVER_URL` has no
 effect there today - it only matters for a deployment that intentionally omits `MOCKSERVER_TARGETS` in
 favor of a single fixed MockServer.
+
+#### Recent Requests history storage
+
+`mock-ui` accumulates the request history it observes for each configured MockServer target into
+that target's own local SQLite file, instead of just mirroring MockServer's current log - so an
+entry MockServer has since evicted from its own `maxLogEntries` ring buffer stays visible on the
+Recent Requests page as long as `mock-ui` saw it at some point. That accumulation is bounded by
+`REQUEST_HISTORY_RETENTION_ROWS` (default `120000` per target): once a target's history exceeds
+the cap, the oldest rows are pruned first.
+
+This storage is local/ephemeral by design - under `REQUEST_HISTORY_DATA_DIR`, on `mock-ui`'s own
+container filesystem, with no PVC or other durable volume. Recent Requests history is **not**
+expected to survive a `mock-ui` restart or pod reschedule; each target's history simply starts
+empty again afterward. Only reliability *while `mock-ui` is running* - no longer silently losing
+an entry to MockServer's own eviction - is in scope. See
+`openspec/changes/persist-recent-requests-history-sqlite/design.md` for the full rationale.
 
 #### Configuring AI mock generation
 

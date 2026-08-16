@@ -36,6 +36,16 @@ spec:
               value: "1"
             - name: HEARTBEAT_INTERVAL_SECONDS
               value: "15"
+            # Recent Requests history storage: how many requests per target mock-ui keeps in its
+            # own local SQLite file before pruning the oldest, and where that file lives. Local/
+            # ephemeral on purpose - no PVC, since history isn't expected to survive a restart or
+            # reschedule, only to stay reliable while mock-ui is running. See README's "Recent
+            # Requests history storage" section and design.md in
+            # openspec/changes/persist-recent-requests-history-sqlite.
+            - name: REQUEST_HISTORY_RETENTION_ROWS
+              value: "620000"
+            - name: REQUEST_HISTORY_DATA_DIR
+              value: "/tmp/mock-ui-request-history"
             # Enables the AI Mock Generator page, backed by AWS Bedrock - see README's "Configuring
             # AI mock generation" section. BEDROCK_MODEL_ID/AWS_REGION are plain config, not
             # secrets. mock-ui fails open (not closed) when BEDROCK_MODEL_ID is unset - see

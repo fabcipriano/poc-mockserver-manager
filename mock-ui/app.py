@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 import urllib.error
@@ -20,19 +21,29 @@ logger = logging.getLogger("mock-ui")
 class Target:
     """One configured MockServer instance: its identity plus its own history-poller state.
 
-    The history-poller fields (lock/snapshot/reset generation) used to be module-level
-    globals shared by a single implicit target; each Target now owns its own, so N
-    configured targets get N independent shared snapshots polled by N independent
-    threads - see design.md's "per-target poller" decision.
+    The history-poller fields used to be module-level globals shared by a single implicit
+    target; each Target now owns its own, so N configured targets get N independent SQLite
+    history stores polled by N independent threads - see design.md's "per-target poller" and
+    "one SQLite file per Target" decisions.
+
+    Observed request history itself is no longer held on this object - it lives in this
+    target's SQLite file (see _open_history_db). `lock` guards only the small bit of state
+    needed to detect a MockServer-side log reset across ticks: `last_polled_entries` (what the
+    *previous* tick fetched from MockServer, not the accumulated persisted history - see
+    design.md decision 2.3) and `history_reset_generation`.
     """
 
     def __init__(self, target_id, label, url):
         self.id = target_id
         self.label = label
         self.url = url
-        self.history_lock = threading.Lock()
-        self.history_snapshot = []
+        self.lock = threading.Lock()
+        self.last_polled_entries = []
         self.history_reset_generation = 0
+        # Opened lazily on first poll tick and reused by that same poller thread across ticks
+        # (WAL mode below lets request-handling threads read concurrently via their own
+        # short-lived connections while this one writes) - see design.md decision 1.3.
+        self.db_conn = None
 
 
 def _parse_targets():
@@ -538,9 +549,21 @@ try:
     # so a live tail with no new requests never goes long enough without a byte on the wire to
     # look idle to an intermediate proxy. See design.md's heartbeat decision.
     HEARTBEAT_INTERVAL_SECONDS = _parse_positive_int_env("HEARTBEAT_INTERVAL_SECONDS", 15)
+    # Row cap per target's SQLite history store, pruned at the end of every poll tick - see
+    # design.md's "fixed row cap" retention decision. Comfortably above REQUEST_HISTORY_LIMIT's
+    # default and above the reproduced load-test's 100,000 distinct requests, so
+    # scripts/load-test-recent-requests.sh's /booking/20123 lookup survives at default settings
+    # rather than being pruned by mock-ui's own cap.
+    REQUEST_HISTORY_RETENTION_ROWS = _parse_positive_int_env("REQUEST_HISTORY_RETENTION_ROWS", 120000)
 except ValueError as exc:
     logger.error("invalid mock-ui runtime configuration: %s", exc)
     raise SystemExit(1) from exc
+
+# Local/ephemeral by design, not a mounted durable volume - Recent Requests history is not
+# expected to survive a mock-ui restart or pod reschedule, only to stay reliable (no silent
+# loss to MockServer's own ring-buffer eviction) while mock-ui keeps running. See design.md's
+# "k8s storage: no PVC" decision and proposal.md's Non-Goals.
+REQUEST_HISTORY_DATA_DIR = os.environ.get("REQUEST_HISTORY_DATA_DIR") or "/tmp/mock-ui-request-history"
 
 
 def _observed_body(body):
@@ -612,20 +635,11 @@ def _parse_query_datetime(value):
     return None
 
 
-def _matches_filters(entry, path_query, mocked_filter, from_dt, to_dt):
-    if path_query and path_query not in (entry["path"] or ""):
-        return False
-    if mocked_filter is not None and entry["mocked"] != mocked_filter:
-        return False
-    if from_dt is not None or to_dt is not None:
-        entry_dt = _parse_entry_datetime(entry["timestamp"])
-        if entry_dt is None:
-            return False
-        if from_dt is not None and entry_dt < from_dt:
-            return False
-        if to_dt is not None and entry_dt > to_dt:
-            return False
-    return True
+def _like_escape(value):
+    """Escapes SQLite LIKE wildcards (%, _) and the escape char itself, so a path filter matches
+    plain substring containment - the same semantics the old in-memory `x in entry["path"]` check
+    had - rather than treating a developer-typed % or _ as a glob wildcard."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _build_history_entry(raw_entry):
@@ -645,38 +659,123 @@ def _build_history_entry(raw_entry):
     }
 
 
-# --- shared history poller ---
+# --- SQLite-backed history store ---
 #
-# One background thread per configured Target fetches that target's full (unfiltered,
-# unpaginated) request log on REQUEST_STREAM_POLL_SECONDS cadence, regardless of how many
-# browser tabs are open, and every request/connection reads from that target's shared,
-# continuously-rebuilt snapshot instead of hitting MockServer itself. Previously each SSE
-# connection polled MockServer independently - with N open tabs that meant N re-fetches and N
-# re-parses of the entire (potentially multi-MB) log every second, which is what collapsed the
-# page under concurrent viewers. See docs/studies/2026-08-09-recent-requests-resilience.md for
-# the full reproduction, and design.md's "per-target poller" decision for why this is now one
-# thread per target rather than one thread total.
-#
-# The snapshot holds nothing MockServer doesn't already have and nothing survives past the next
-# tick, so this isn't the kind of independent cache the mocks CRUD flows are required to avoid -
-# see design.md in the improve-recent-requests-resilience change for why.
+# Each Target accumulates the request history it has observed into its own SQLite file under
+# REQUEST_HISTORY_DATA_DIR, instead of mirroring MockServer's current log in memory. A dedicated
+# background thread per configured Target still fetches that target's full (unfiltered,
+# unpaginated) request log on REQUEST_STREAM_POLL_SECONDS cadence - see
+# docs/studies/2026-08-09-recent-requests-resilience.md for why this is one shared poll per
+# target rather than one per viewer - but each tick now upserts into SQLite (INSERT OR IGNORE on
+# a dedup key, since MockServer assigns no stable per-request id) instead of replacing an
+# in-memory snapshot wholesale. That's what makes an entry MockServer has since evicted from its
+# own ring buffer stay visible here: once a row is in SQLite, a later tick no longer returning it
+# from MockServer does not remove it. See proposal.md and design.md for the full rationale,
+# including why this is local/ephemeral storage (no PVC) rather than durable across restarts.
+
+HISTORY_TABLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    method TEXT,
+    path TEXT,
+    status_code INTEGER,
+    mocked INTEGER NOT NULL,
+    request_headers TEXT NOT NULL,
+    request_body TEXT,
+    response_headers TEXT NOT NULL,
+    response_body TEXT,
+    UNIQUE (timestamp, method, path, status_code)
+)
+"""
 
 
-def _detect_history_reset(previous_snapshot, new_snapshot):
-    """True if new_snapshot looks like MockServer's log was reset rather than just polled again.
+def _history_db_path(target_id):
+    os.makedirs(REQUEST_HISTORY_DATA_DIR, exist_ok=True)
+    return os.path.join(REQUEST_HISTORY_DATA_DIR, f"{target_id}.db")
+
+
+def _open_history_db(target):
+    """Opens a fresh connection to a target's SQLite history store, creating the data
+    directory/file/schema on first use. WAL mode lets request-handling threads read
+    concurrently through their own short-lived connections while the poller thread's
+    long-lived connection writes - see design.md decision 1.3."""
+    conn = sqlite3.connect(_history_db_path(target.id), timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(HISTORY_TABLE_SCHEMA)
+    conn.commit()
+    return conn
+
+
+def _row_to_entry(row):
+    (row_id, timestamp, method, path, status_code, mocked, request_headers, request_body, response_headers, response_body) = row
+    return {
+        # Opaque pagination cursor (see list_requests) - not shown to the developer, only echoed
+        # back as the "before" query param. Backed by rowid rather than "timestamp" so same-
+        # timestamp siblings can no longer tie-break ambiguously - see design.md decision.
+        "cursor": row_id,
+        "timestamp": timestamp,
+        "method": method,
+        "path": path,
+        "statusCode": status_code,
+        "mocked": bool(mocked),
+        "requestHeaders": json.loads(request_headers),
+        "requestBody": json.loads(request_body) if request_body is not None else None,
+        "responseHeaders": json.loads(response_headers),
+        "responseBody": json.loads(response_body) if response_body is not None else None,
+    }
+
+
+def _upsert_history_entries(conn, entries):
+    for entry in entries:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO requests
+                (timestamp, method, path, status_code, mocked, request_headers, request_body, response_headers, response_body)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entry["timestamp"],
+                entry["method"],
+                entry["path"],
+                entry["statusCode"],
+                1 if entry["mocked"] else 0,
+                json.dumps(entry["requestHeaders"]),
+                json.dumps(entry["requestBody"]) if entry["requestBody"] is not None else None,
+                json.dumps(entry["responseHeaders"]),
+                json.dumps(entry["responseBody"]) if entry["responseBody"] is not None else None,
+            ),
+        )
+
+
+def _prune_history(conn, retention_rows):
+    """Deletes the oldest rows past retention_rows, by rowid - see design.md's "fixed row cap"
+    retention decision."""
+    conn.execute(
+        "DELETE FROM requests WHERE id NOT IN (SELECT id FROM requests ORDER BY id DESC LIMIT ?)",
+        (retention_rows,),
+    )
+
+
+def _detect_history_reset(previous_entries, new_entries):
+    """True if new_entries looks like MockServer's log was reset rather than just polled again.
 
     MockServer's request log is append-only from the newest end and only evicts from the
     oldest end, so a legitimate poll's newest entry should either match what we already saw or
     be a genuinely later one still preceded by it. A reset instead makes the previously-newest
-    entry vanish entirely - either because the new snapshot is empty, or because it's non-empty
-    but doesn't contain that entry's timestamp anywhere.
+    entry vanish entirely - either because the new batch is empty, or because it's non-empty but
+    doesn't contain that entry's timestamp anywhere.
+
+    Compares against what was last fetched *from MockServer* specifically (previous_entries),
+    not against the full accumulated persisted history, which by design no longer shrinks in
+    step with MockServer's own log - see design.md decision 2.3.
     """
-    if not previous_snapshot:
+    if not previous_entries:
         return False
-    if not new_snapshot:
+    if not new_entries:
         return True
-    previous_newest_timestamp = previous_snapshot[-1]["timestamp"]
-    return not any(entry["timestamp"] == previous_newest_timestamp for entry in new_snapshot)
+    previous_newest_timestamp = previous_entries[-1]["timestamp"]
+    return not any(entry["timestamp"] == previous_newest_timestamp for entry in new_entries)
 
 
 def _poll_history_once(target):
@@ -684,21 +783,31 @@ def _poll_history_once(target):
     try:
         raw_entries = _mockserver_put(target, "/mockserver/retrieve?type=REQUEST_RESPONSES", {}) or []
     except MockServerError as exc:
-        # Keep serving the previous snapshot rather than blanking it out on a transient failure.
+        # Keep the persisted store as-is rather than losing anything on a transient failure.
         logger.warning("history poll failed for target %s after %.3fs: %s", target.id, time.monotonic() - start, exc)
         return
     latency = time.monotonic() - start
     built = [_build_history_entry(entry) for entry in raw_entries]
-    with target.history_lock:
-        reset_detected = _detect_history_reset(target.history_snapshot, built)
-        previous_count = len(target.history_snapshot)
+
+    with target.lock:
+        reset_detected = _detect_history_reset(target.last_polled_entries, built)
+        previous_count = len(target.last_polled_entries)
         if reset_detected:
             target.history_reset_generation += 1
         generation = target.history_reset_generation
-        target.history_snapshot = built
+        target.last_polled_entries = built
+
+    if target.db_conn is None:
+        target.db_conn = _open_history_db(target)
+    with target.db_conn:
+        # `with conn:` commits (or rolls back) as one transaction, so a tick's upserts and its
+        # retention pruning land together - see design.md's retention decision.
+        _upsert_history_entries(target.db_conn, built)
+        _prune_history(target.db_conn, REQUEST_HISTORY_RETENTION_ROWS)
+
     if reset_detected:
         logger.warning(
-            "history reset detected for target %s (generation now %d): previous snapshot had %d entries, new snapshot has %d entries",
+            "history reset detected for target %s (generation now %d): previous poll had %d entries, new poll has %d entries",
             target.id,
             generation,
             previous_count,
@@ -713,7 +822,7 @@ def _history_poller_loop(target):
             _poll_history_once(target)
         except Exception:
             # _poll_history_once already handles the expected MockServerError case (logs and
-            # keeps serving the stale snapshot) - this is a last-resort backstop so *any* other
+            # leaves the persisted store as-is) - this is a last-resort backstop so *any* other
             # unexpected exception can't silently kill this daemon thread and permanently freeze
             # Recent Requests for the rest of this mock-ui process's life, with nothing left to
             # ever retry MockServer again. See fix-recent-requests-stale-rows/design.md.
@@ -721,13 +830,8 @@ def _history_poller_loop(target):
         time.sleep(REQUEST_STREAM_POLL_SECONDS)
 
 
-def _get_history_snapshot(target):
-    with target.history_lock:
-        return list(target.history_snapshot)
-
-
 def _get_history_reset_generation(target):
-    with target.history_lock:
+    with target.lock:
         return target.history_reset_generation
 
 
@@ -740,33 +844,87 @@ def list_requests():
     to_dt = _parse_query_datetime(request.args.get("to"))
     before_cursor = request.args.get("before")
 
-    snapshot = _get_history_snapshot(target)
-    oldest_available_timestamp = snapshot[0]["timestamp"] if snapshot else None
+    conn = _open_history_db(target)
+    try:
+        oldest_row = conn.execute("SELECT timestamp FROM requests ORDER BY id ASC LIMIT 1").fetchone()
+        oldest_available_timestamp = oldest_row[0] if oldest_row else None
 
-    filtered = [entry for entry in snapshot if _matches_filters(entry, path_query, mocked_filter, from_dt, to_dt)]
-    if before_cursor:
-        # Tie-break for entries sharing the exact same millisecond timestamp as the cursor:
-        # strict "<" means a same-timestamp sibling positioned before the cursor entry in
-        # MockServer's own return order could be skipped rather than shown on the next page.
-        # Documented, accepted known limitation (see design.md) rather than solved with a
-        # stable per-entry id - collisions at millisecond precision are rare at this scale.
-        filtered = [entry for entry in filtered if entry["timestamp"] < before_cursor]
+        query = (
+            "SELECT id, timestamp, method, path, status_code, mocked, request_headers, "
+            "request_body, response_headers, response_body FROM requests WHERE 1=1"
+        )
+        params = []
+        if path_query:
+            query += " AND path LIKE ? ESCAPE '\\'"
+            params.append(f"%{_like_escape(path_query)}%")
+        if mocked_filter is not None:
+            query += " AND mocked = ?"
+            params.append(1 if mocked_filter else 0)
+        if from_dt is not None:
+            query += " AND timestamp >= ?"
+            params.append(from_dt.strftime(ENTRY_TIMESTAMP_FORMAT))
+        if to_dt is not None:
+            query += " AND timestamp <= ?"
+            params.append(to_dt.strftime(ENTRY_TIMESTAMP_FORMAT))
+        if before_cursor is not None:
+            try:
+                before_id = int(before_cursor)
+            except ValueError:
+                before_id = None
+            if before_id is not None:
+                query += " AND id < ?"
+                params.append(before_id)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(REQUEST_HISTORY_LIMIT + 1)
 
-    has_more = len(filtered) > REQUEST_HISTORY_LIMIT
-    page = filtered[-REQUEST_HISTORY_LIMIT:]
-    newest_first = list(reversed(page))
+        rows = conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+    has_more = len(rows) > REQUEST_HISTORY_LIMIT
+    entries = [_row_to_entry(row) for row in rows[:REQUEST_HISTORY_LIMIT]]
 
     oldest_available_dt = _parse_entry_datetime(oldest_available_timestamp)
     range_truncated = bool(from_dt and oldest_available_dt and from_dt < oldest_available_dt)
 
     return jsonify(
         {
-            "entries": newest_first,
+            "entries": entries,
             "hasMore": has_more,
             "oldestAvailableTimestamp": oldest_available_timestamp,
             "rangeTruncated": range_truncated,
         }
     )
+
+
+def _new_history_entries_since(target, since_id, path_query, mocked_filter):
+    conn = _open_history_db(target)
+    try:
+        query = (
+            "SELECT id, timestamp, method, path, status_code, mocked, request_headers, "
+            "request_body, response_headers, response_body FROM requests WHERE id > ?"
+        )
+        params = [since_id]
+        if path_query:
+            query += " AND path LIKE ? ESCAPE '\\'"
+            params.append(f"%{_like_escape(path_query)}%")
+        if mocked_filter is not None:
+            query += " AND mocked = ?"
+            params.append(1 if mocked_filter else 0)
+        query += " ORDER BY id ASC"
+        rows = conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+    return [_row_to_entry(row) for row in rows]
+
+
+def _latest_history_id(target):
+    conn = _open_history_db(target)
+    try:
+        row = conn.execute("SELECT MAX(id) FROM requests").fetchone()
+    finally:
+        conn.close()
+    return row[0] if row and row[0] is not None else 0
 
 
 @app.get("/mock-ui/api/requests/stream")
@@ -781,11 +939,10 @@ def stream_requests():
     def event_stream():
         # Start tailing from "now" - the page loads existing history separately via
         # /mock-ui/api/requests, so the stream should only push genuinely new arrivals. Reads
-        # the shared snapshot rather than polling MockServer itself - see the poller comment
-        # above.
+        # from the target's SQLite store rather than polling MockServer itself - see the
+        # storage comment above.
         logger.info("SSE client connected (target=%s, path=%r, mocked=%r)", target.id, path_query, mocked_filter)
-        snapshot = _get_history_snapshot(target)
-        last_timestamp = snapshot[-1]["timestamp"] if snapshot else ""
+        last_id = _latest_history_id(target)
         last_sent = time.monotonic()
         # Initialized to the *current* generation so a freshly-opened connection never gets a
         # reset notice for one that already happened before it connected.
@@ -801,24 +958,19 @@ def stream_requests():
                     yield "event: history-reset\ndata: {}\n\n"
                     last_seen_generation = current_generation
                     last_sent = time.monotonic()
-                    # The post-reset snapshot's entries are unrelated to what we've already
-                    # sent - resync last_timestamp to "now" so the live tail only resumes with
-                    # genuinely new entries going forward, instead of replaying the whole
+                    # A MockServer-side reset doesn't reset mock-ui's own accumulated store, but
+                    # the entries already sent through this tail are unrelated to what MockServer
+                    # will report going forward - resync last_id to "now" so the live tail only
+                    # resumes with genuinely new entries, instead of replaying the whole
                     # post-reset log through the tail on top of the client's own resync fetch.
-                    snapshot = _get_history_snapshot(target)
-                    last_timestamp = snapshot[-1]["timestamp"] if snapshot else ""
+                    last_id = _latest_history_id(target)
                     continue
-                snapshot = _get_history_snapshot(target)
-                new_entries = [
-                    entry
-                    for entry in snapshot
-                    if entry["timestamp"] > last_timestamp and _matches_filters(entry, path_query, mocked_filter, None, None)
-                ]
+                new_entries = _new_history_entries_since(target, last_id, path_query, mocked_filter)
                 for entry in new_entries:
                     yield f"data: {json.dumps(entry)}\n\n"
                     last_sent = time.monotonic()
                 if new_entries:
-                    last_timestamp = new_entries[-1]["timestamp"]
+                    last_id = new_entries[-1]["cursor"]
                 elif time.monotonic() - last_sent >= HEARTBEAT_INTERVAL_SECONDS:
                     # SSE comment line: ignored by EventSource.onmessage, but keeps bytes
                     # flowing so an idle-connection timeout in front of us never trips.
