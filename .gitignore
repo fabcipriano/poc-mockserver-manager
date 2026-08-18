@@ -13,3 +13,4 @@ target/
 
 # Personal/local overrides
 .claude/settings.local.json
+.aider*
